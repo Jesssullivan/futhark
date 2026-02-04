@@ -440,6 +440,7 @@ onHostOp (ImpGPU.GetSizeMax v size_class) =
 kernelsToWebGPU :: ImpGPU.Program -> Program
 kernelsToWebGPU prog =
   let ImpGPU.Definitions
+        params_
         types
         (ImpGPU.Constants ps consts)
         (ImpGPU.Functions funs) = prog
@@ -461,12 +462,12 @@ kernelsToWebGPU prog =
           (,) <$> traverse onHostOp consts <*> traverse (traverse (traverse onHostOp)) funs
 
       prog' =
-        Definitions types (Constants ps consts') (Functions funs')
+        Definitions params_ types (Constants ps consts') (Functions funs')
 
       kernels = M.fromList $ map (first nameFromText) (wsKernels translation)
       constants = wsMacroDefs translation
       -- TODO: Compute functions using tuning params
-      params = M.map (,S.empty) $ wsSizes translation
+      params = M.map (\sc -> (Just sc, S.empty)) $ wsSizes translation
       failures = mempty
    in Program
         { webgpuProgram = wsCode translation,

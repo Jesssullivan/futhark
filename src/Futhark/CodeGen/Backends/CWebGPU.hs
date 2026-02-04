@@ -317,7 +317,7 @@ asyncCall func hasReturn args =
       "[" <> T.intercalate ", " args <> "]"
 
 mkJsContext :: Definitions a -> T.Text -> (T.Text, [T.Text])
-mkJsContext (Definitions _ _ (Functions funs)) manifest =
+mkJsContext (Definitions _ _ _ (Functions funs)) manifest =
   ( [text|
    class FutharkModule {
      ${constructor}
@@ -437,14 +437,13 @@ compileProg ::
   m (ImpGen.Warnings, (GC.CParts, T.Text, [T.Text]))
 compileProg version prog = do
   ( ws,
-    Program wgsl_code wgsl_prelude macros kernels params failures prog'
+    Program wgsl_code wgsl_prelude macros kernels _params failures prog'
     ) <-
     ImpGen.compileProg prog
   c <-
     GC.compileProg
       "webgpu"
       version
-      params
       operations
       (mkBoilerplate (wgsl_prelude <> wgsl_code) macros kernels [] failures)
       webgpu_includes
