@@ -1,6 +1,40 @@
 {-# LANGUAGE TemplateHaskell #-}
 
--- | Code snippets used by the WebGPU backend as part of WGSL shaders.
+-- |
+-- Module      : Futhark.CodeGen.RTS.WGSL
+-- Description : WGSL runtime shader code for WebGPU
+-- Stability   : experimental
+--
+-- This module embeds WGSL (WebGPU Shading Language) code snippets that are
+-- included in every WebGPU program. These provide the runtime support
+-- functions needed by generated kernels.
+--
+-- == Embedded Files
+--
+-- The WGSL code is embedded at compile time from @rts\/wgsl\/*.wgsl@:
+--
+--   * @scalar.wgsl@ - Basic scalar operations and constants
+--   * @scalar8.wgsl@ - 8-bit integer emulation (packed in i32)
+--   * @scalar16.wgsl@ - 16-bit integer emulation (packed in i32)
+--   * @scalar32.wgsl@ - 32-bit operations and utilities
+--   * @scalar64.wgsl@ - 64-bit integer emulation using @vec2\<i32\>@
+--   * @atomics.wgsl@ - Atomic operation implementations
+--
+-- == Built-in Kernels
+--
+-- This module also provides built-in kernel templates for common operations:
+--
+--   * 'lmad_copy' - Generic array copy with LMAD (linear memory access descriptor)
+--   * 'map_transpose' - Matrix transpose with shared memory tiling
+--   * Transpose variants for different matrix shapes (low height, low width, small, large)
+--
+-- These templates use placeholder names (@NAME@, @ELEM_TYPE@) that are
+-- substituted at code generation time.
+--
+-- == Prelude
+--
+-- The 'wgsl_prelude' combines all scalar support code into a single text
+-- block that is prepended to every generated WGSL program.
 module Futhark.CodeGen.RTS.WGSL
   ( scalar,
     scalar8,
@@ -51,6 +85,16 @@ atomics :: T.Text
 atomics = $(embedStringFile "rts/wgsl/atomics.wgsl")
 {-# NOINLINE atomics #-}
 
+-- | The complete WGSL prelude prepended to all generated programs.
+--
+-- Includes:
+--
+--   * @enable f16;@ directive for 16-bit float support
+--   * Scalar operations (32-bit first, then 8\/16\/64-bit emulation)
+--   * Atomic operation implementations
+--
+-- The ordering is important: scalar32 must come before scalar8\/16\/64
+-- because they all use i32 internally.
 wgsl_prelude :: T.Text
 wgsl_prelude =
   -- Put scalar32 in front of the other integer types since they are all

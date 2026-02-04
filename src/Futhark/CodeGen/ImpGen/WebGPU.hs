@@ -1,8 +1,56 @@
 {-# LANGUAGE LambdaCase #-}
 
--- | Code generation for ImpCode with WebGPU.
+-- |
+-- Module      : Futhark.CodeGen.ImpGen.WebGPU
+-- Description : WGSL shader code generation for WebGPU
+-- Stability   : experimental
+--
+-- This module translates Futhark's GPU intermediate representation into
+-- WGSL (WebGPU Shading Language) compute shaders.
+--
+-- == Key Responsibilities
+--
+--   * Translate GPU kernels to WGSL compute shaders
+--   * Handle type emulation for types not native to WGSL (i8, i16, i64)
+--   * Generate uniform buffer layouts for kernel parameters
+--   * Manage workgroup shared memory allocation
+--   * Handle atomic operations across different element sizes
+--
+-- == WGSL Limitations
+--
+-- WGSL has limitations compared to OpenCL\/CUDA that require workarounds:
+--
+--   * __No 8-bit or 16-bit integers__: Emulated via packing into i32
+--   * __No 64-bit floats__: f64 programs are rejected at compile time
+--   * __64-bit integers__: Emulated using @vec2\<i32\>@
+--   * __Different memory model__: Atomics use WGSL's built-in atomic types
+--
+-- == Type Mapping
+--
+-- Futhark types are mapped to WGSL as follows:
+--
+-- @
+-- i8, i16  -> i32 (packed/unpacked as needed)
+-- i32      -> i32
+-- i64      -> vec2\<i32\> (low, high words)
+-- f16      -> f16 (requires "enable f16" directive)
+-- f32      -> f32
+-- f64      -> NOT SUPPORTED
+-- bool     -> bool (i32 for uniform buffers)
+-- @
+--
+-- == Compilation Pipeline
+--
+-- The main entry point is 'compileProg', which:
+--
+--   1. Compiles the GPUMem program using the OpenCL ImpGen infrastructure
+--   2. Translates each GPU kernel to WGSL using 'kernelsToWebGPU'
+--   3. Produces a 'Program' containing WGSL code, kernel interfaces, and host code
 module Futhark.CodeGen.ImpGen.WebGPU
-  ( compileProg,
+  ( -- * Compilation
+    compileProg,
+
+    -- * Re-exports
     Warnings,
   )
 where
@@ -23,7 +71,7 @@ import Futhark.CodeGen.ImpCode.GPU qualified as ImpGPU
 import Futhark.CodeGen.ImpCode.WebGPU
 import Futhark.CodeGen.ImpGen.GPU qualified as ImpGPU
 import Futhark.CodeGen.RTS.WGSL qualified as RTS
-import Futhark.Error (compilerLimitation)
+import Futhark.Error (compilerBug, compilerLimitation)
 import Futhark.IR.GPUMem qualified as F
 import Futhark.MonadFreshNames
 import Futhark.Util (convFloat, nubOrd, zEncodeText)
@@ -35,6 +83,7 @@ import Language.WGSL qualified as WGSL
 data WebGPUS = WebGPUS
   { -- | Accumulated code.
     wsCode :: T.Text,
+    wsSizes :: M.Map Name SizeClass,
     wsMacroDefs :: [(Name, KernelConstExp)],
     -- | Interface of kernels already generated into wsCode.
     wsKernels :: [(WGSL.Ident, KernelInterface)],
@@ -47,6 +96,10 @@ data WebGPUS = WebGPUS
 
 -- The monad in which we perform the overall translation.
 type WebGPUM = State.State WebGPUS
+
+addSize :: Name -> SizeClass -> WebGPUM ()
+addSize key sclass =
+  State.modify $ \s -> s {wsSizes = M.insert key sclass $ wsSizes s}
 
 addMacroDef :: Name -> KernelConstExp -> WebGPUM ()
 addMacroDef key e =
@@ -176,7 +229,10 @@ builtinBlockSize :: Int -> KernelM WGSL.Ident
 builtinBlockSize 0 = mkGlobalIdent "block_size_x"
 builtinBlockSize 1 = mkGlobalIdent "block_size_y"
 builtinBlockSize 2 = mkGlobalIdent "block_size_z"
-builtinBlockSize _ = error "invalid block size dimension"
+builtinBlockSize dim =
+  compilerBug $
+    "WebGPU backend: invalid block size dimension " <> prettyText dim <> ".\n"
+      <> "Valid dimensions are 0 (x), 1 (y), and 2 (z)."
 
 -- Main function for translating an ImpGPU kernel to a WebGPU kernel.
 genKernel :: ImpGPU.Kernel -> WebGPUM (KernelName, [(Exp, PrimType)])
@@ -268,7 +324,12 @@ functionMayFail fname = S.member fname . wsFunsMayFail
 genFunParams :: [Param] -> KernelM [WGSL.Param]
 genFunParams =
   mapM $ \case
-    MemParam _ _ -> compilerLimitation "WebGPU backend cannot handle GPU functions with memory parameters."
+    MemParam name _ ->
+      compilerLimitation . T.unlines $
+        [ "WebGPU backend: GPU device function has memory parameter '" <> prettyText name <> "'.",
+          "WGSL does not support passing memory references to device functions.",
+          "Only scalar parameters are supported in GPU helper functions."
+        ]
     ScalarParam name tp -> do
       ident <- getIdent name
       pure $ WGSL.Param ident (WGSL.Prim $ wgslPrimType tp) []
@@ -276,14 +337,24 @@ genFunParams =
 generateDeviceFun :: Name -> ImpGPU.Function ImpGPU.KernelOp -> KernelM ()
 generateDeviceFun fname device_func = do
   when (any memParam $ functionInput device_func) $
-    compilerLimitation "WebGPU backend cannot generate GPU functions that use arrays."
+    compilerLimitation . T.unlines $
+      [ "WebGPU backend: GPU device function '" <> nameToText fname <> "' uses array parameters.",
+        "WGSL does not support passing arrays to device functions.",
+        "Only scalar values can be passed as function arguments on GPU."
+      ]
   ws <- lift State.get
   ks <- get
   r <- ask
   (body, _, _) <- lift $ runRWST (genWGSLStm (functionBody device_func)) r ks
 
   if functionMayFail fname ws
-    then compilerLimitation "WebGPU backend Cannot handle GPU functions that may fail."
+    then
+      compilerLimitation . T.unlines $
+        [ "WebGPU backend: GPU device function '" <> nameToText fname <> "' may fail.",
+          "WGSL does not support error handling within device functions.",
+          "Functions called from GPU kernels cannot contain assertions or bounds checks",
+          "that might fail at runtime."
+        ]
     else do
       in_params <- genFunParams (functionInput device_func)
       out_params <- genFunParams (functionOutput device_func)
@@ -332,7 +403,12 @@ genDeviceFuns code = do
       Nothing -> pure ()
   where
     toDevice :: ImpGPU.HostOp -> ImpGPU.KernelOp
-    toDevice _ = compilerLimitation "WebGPU backend cannot handle GPU functions that contain parallelism."
+    toDevice _ =
+      compilerLimitation . T.unlines $
+        [ "WebGPU backend: GPU device function contains parallel operations.",
+          "WGSL device functions cannot launch nested parallel operations.",
+          "Functions called from GPU kernels must be purely sequential."
+        ]
 
 onKernel :: ImpGPU.Kernel -> WebGPUM HostOp
 onKernel kernel = do
@@ -342,7 +418,7 @@ onKernel kernel = do
   let extraArgs = [ValueKArg e t | (e, t) <- extraArgExps]
   let scalarArgs =
         [ ValueKArg (LeafExp n t) t
-        | ImpGPU.ScalarUse n t <- ImpGPU.kernelUses kernel
+          | ImpGPU.ScalarUse n t <- ImpGPU.kernelUses kernel
         ]
   let memArgs = [MemKArg n | ImpGPU.MemoryUse n <- ImpGPU.kernelUses kernel]
   let args = extraArgs ++ scalarArgs ++ memArgs
@@ -351,9 +427,11 @@ onKernel kernel = do
 
 onHostOp :: ImpGPU.HostOp -> WebGPUM HostOp
 onHostOp (ImpGPU.CallKernel k) = onKernel k
-onHostOp (ImpGPU.GetSize v key _) =
+onHostOp (ImpGPU.GetSize v key size_class) = do
+  addSize key size_class
   pure $ GetSize v key
-onHostOp (ImpGPU.CmpSizeLe v key _ x) =
+onHostOp (ImpGPU.CmpSizeLe v key size_class x) = do
+  addSize key size_class
   pure $ CmpSizeLe v key x
 onHostOp (ImpGPU.GetSizeMax v size_class) =
   pure $ GetSizeMax v size_class
@@ -362,7 +440,6 @@ onHostOp (ImpGPU.GetSizeMax v size_class) =
 kernelsToWebGPU :: ImpGPU.Program -> Program
 kernelsToWebGPU prog =
   let ImpGPU.Definitions
-        params
         types
         (ImpGPU.Constants ps consts)
         (ImpGPU.Functions funs) = prog
@@ -370,6 +447,7 @@ kernelsToWebGPU prog =
       initial_state =
         WebGPUS
           { wsCode = mempty,
+            wsSizes = mempty,
             wsMacroDefs = mempty,
             wsKernels = mempty,
             wsNextBindSlot = 0,
@@ -383,16 +461,19 @@ kernelsToWebGPU prog =
           (,) <$> traverse onHostOp consts <*> traverse (traverse (traverse onHostOp)) funs
 
       prog' =
-        Definitions params types (Constants ps consts') (Functions funs')
+        Definitions types (Constants ps consts') (Functions funs')
 
       kernels = M.fromList $ map (first nameFromText) (wsKernels translation)
       constants = wsMacroDefs translation
+      -- TODO: Compute functions using tuning params
+      params = M.map (,S.empty) $ wsSizes translation
       failures = mempty
    in Program
         { webgpuProgram = wsCode translation,
           webgpuPrelude = RTS.wgsl_prelude,
           webgpuMacroDefs = constants,
           webgpuKernels = kernels,
+          webgpuParams = params,
           webgpuFailures = failures,
           hostDefinitions = prog'
         }
@@ -413,7 +494,13 @@ wgslPrimType (IntType Int32) = WGSL.Int32
 wgslPrimType (IntType Int64) = wgslInt64
 wgslPrimType (FloatType Float16) = WGSL.Float16
 wgslPrimType (FloatType Float32) = WGSL.Float32
-wgslPrimType (FloatType Float64) = compilerLimitation "WebGPU backend does not support f64."
+wgslPrimType (FloatType Float64) =
+  compilerLimitation . T.unlines $
+    [ "f64 (double precision floating point) is not supported by the WebGPU backend.",
+      "WGSL only supports f32 (32-bit) and f16 (16-bit) floating point types.",
+      "Consider using f32 instead, or use a different backend (e.g., opencl, cuda) if",
+      "double precision is required."
+    ]
 wgslPrimType Bool = WGSL.Bool
 -- TODO: Make sure we do not ever codegen statements involving Unit variables
 wgslPrimType Unit = WGSL.Float16 -- error "TODO: no unit in WGSL"
@@ -458,7 +545,11 @@ packedElemIndex (IntType Int16) i = WGSL.BinOpExp "/" i (WGSL.IntExp 2)
 packedElemIndex (IntType Int32) i = i
 packedElemIndex (FloatType Float16) i = WGSL.BinOpExp "/" i (WGSL.IntExp 2)
 packedElemIndex (FloatType Float32) i = i
-packedElemIndex _ _ = error "CodeGen.ImpGen.WebGPU:packedElemIndex: Unsupported Type"
+packedElemIndex t _ =
+  compilerLimitation . T.unlines $
+    [ "WebGPU backend: unsupported type '" <> prettyText t <> "' for packed element access.",
+      "This type cannot be used in packed memory operations."
+    ]
 
 packedElemOffset :: PrimType -> WGSL.Exp -> WGSL.Exp
 packedElemOffset Bool i = WGSL.BinOpExp "%" i (WGSL.IntExp 4)
@@ -467,7 +558,11 @@ packedElemOffset (IntType Int16) i = WGSL.BinOpExp "%" i (WGSL.IntExp 2)
 packedElemOffset (IntType Int32) _ = WGSL.IntExp 0
 packedElemOffset (FloatType Float16) i = WGSL.BinOpExp "%" i (WGSL.IntExp 2)
 packedElemOffset (FloatType Float32) _ = WGSL.IntExp 0
-packedElemOffset _ _ = error "CodeGen.ImpGen.WebGPU:packedElemOffset: Unsupported Type"
+packedElemOffset t _ =
+  compilerLimitation . T.unlines $
+    [ "WebGPU backend: unsupported type '" <> prettyText t <> "' for packed element offset.",
+      "This type cannot be used in packed memory operations."
+    ]
 
 nativeAccessType :: PrimType -> Bool
 nativeAccessType (IntType Int64) = True
@@ -617,15 +712,16 @@ genCopy pt shape (dst, dst_space) (dst_offset, dst_strides) (src, src_space) (sr
         (WGSL.Assign i $ wgslBinOp (Add Int64 OverflowWrap) (WGSL.VarExp i) one)
         (loops ins body)
 
-unsupported :: Code ImpGPU.KernelOp -> KernelM WGSL.Stmt
-unsupported stmt = pure $ WGSL.Comment $ "Unsupported stmt: " <> prettyText stmt
-
 wgslProduct :: [SubExp] -> WGSL.Exp
 wgslProduct [] = WGSL.IntExp 1
 wgslProduct [Constant (IntValue v)] = WGSL.IntExp $ valueIntegral v
 wgslProduct ((Constant (IntValue v)) : vs) =
   wgslBinOp (Mul Int32 OverflowWrap) (WGSL.IntExp $ valueIntegral v) (wgslProduct vs)
-wgslProduct _ = error "wgslProduct: non-constant product"
+wgslProduct exprs =
+  compilerBug $
+    "WebGPU backend: wgslProduct expects only constant integer products.\n"
+      <> "Got non-constant or non-integer expressions: "
+      <> prettyText exprs
 
 genWGSLStm :: Code ImpGPU.KernelOp -> KernelM WGSL.Stmt
 genWGSLStm Skip = pure WGSL.Skip
@@ -678,12 +774,29 @@ genWGSLStm (DeclareMem name (Space "shared")) = do
 genWGSLStm (DeclareMem name (ScalarSpace vs pt)) =
   pure $
     WGSL.DeclareVar (nameToIdent name) (WGSL.Array (wgslPrimType pt) (Just $ wgslProduct vs))
-genWGSLStm s@(DeclareMem _ _) = unsupported s
+genWGSLStm (DeclareMem name space) =
+  compilerLimitation . T.unlines $
+    [ "WebGPU backend: unsupported memory space '" <> prettyText space <> "'",
+      "  for memory block '" <> prettyText name <> "'.",
+      "Only 'shared' memory and scalar spaces are supported in GPU kernels.",
+      "Device memory must be passed as a kernel parameter, not declared within."
+    ]
 genWGSLStm (DeclareScalar name _ typ) =
   pure $
     WGSL.DeclareVar (nameToIdent name) (WGSL.Prim $ wgslPrimType typ)
-genWGSLStm s@(DeclareArray {}) = unsupported s
-genWGSLStm s@(Allocate {}) = unsupported s
+genWGSLStm (DeclareArray name _ _) =
+  compilerLimitation . T.unlines $
+    [ "WebGPU backend: constant array declaration '" <> prettyText name <> "' in GPU kernel.",
+      "WGSL does not support declaring constant arrays within compute shaders.",
+      "This operation should be handled at a higher level in the compiler."
+    ]
+genWGSLStm (Allocate name _ space) =
+  compilerLimitation . T.unlines $
+    [ "WebGPU backend: memory allocation for '" <> prettyText name <> "'",
+      "  in space '" <> prettyText space <> "' within GPU kernel.",
+      "WGSL does not support dynamic memory allocation within compute shaders.",
+      "All memory must be pre-allocated and passed as kernel parameters."
+    ]
 genWGSLStm s@(Free _ _) = pure $ WGSL.Comment $ "free: " <> prettyText s
 genWGSLStm (Copy pt shape dst dst_lmad src src_lmad) = genCopy pt shape dst dst_lmad src src_lmad
 genWGSLStm (Write mem i Bool s _ v) = genArrayWrite Bool s mem i (genWGSLExp v)
@@ -712,9 +825,12 @@ genWGSLStm (Read tgt mem i t s _) = do
     else pure $ WGSL.Assign tgt' (WGSL.IndexExp mem' i')
 genWGSLStm stm@(SetMem {}) =
   compilerLimitation . docText $
-    "WebGPU backend Cannot handle SetMem statement"
+    "WebGPU backend: SetMem statement not supported in GPU kernels."
       </> indent 2 (align (pretty stm))
-      </> "in GPU kernel."
+      </> "WGSL does not support memory aliasing or pointer reassignment."
+      </> "This typically occurs when arrays are conditionally bound to different"
+      </> "memory locations. Consider restructuring the code to avoid conditional"
+      </> "memory bindings."
 genWGSLStm (Call [dest] f args) = do
   fun <- WGSL.CallExp . ("futrts_" <>) <$> getIdent f
   let getArg (ExpArg e) = genWGSLExp e
@@ -793,7 +909,13 @@ genWGSLStm (Op (ImpGPU.Barrier ImpGPU.FenceLocal)) =
   pure $ WGSL.Call "workgroupBarrier" []
 genWGSLStm (Op (ImpGPU.Barrier ImpGPU.FenceGlobal)) =
   pure $ WGSL.Call "storageBarrier" []
-genWGSLStm s@(Op (ImpGPU.MemFence _)) = unsupported s
+genWGSLStm (Op (ImpGPU.MemFence fence)) =
+  -- MemFence without barrier is currently not well-defined in WGSL.
+  -- We emit a comment rather than an error since this may be benign in some contexts.
+  pure $ WGSL.Comment $ "MemFence (unsupported): " <> fenceText fence
+  where
+    fenceText ImpGPU.FenceLocal = "local"
+    fenceText ImpGPU.FenceGlobal = "global"
 genWGSLStm (Op (ImpGPU.SharedAlloc name size)) = do
   let name' = nameToIdent name
   sizeName <- mkGlobalIdent $ name' <> "_size"
@@ -818,7 +940,6 @@ genWGSLStm (Op (ImpGPU.UniformRead tgt mem i _ _)) = do
     WGSL.Assign tgt' $
       WGSL.CallExp "workgroupUniformLoad" [WGSL.UnOpExp "&" $ WGSL.IndexExp mem' i']
 genWGSLStm (Op (ImpGPU.ErrorSync f)) = genWGSLStm $ Op (ImpGPU.Barrier f)
-genWGSLStm GetUserParam {} = error "genWGSLStm: GetUserParam not handled."
 
 call1 :: WGSL.Ident -> WGSL.Exp -> WGSL.Exp
 call1 f a = WGSL.CallExp f [a]
@@ -967,7 +1088,26 @@ wgslConvOp op a = WGSL.CallExp (fun op) [a]
     fun (BToI Int16) = "bool_to_i16"
     fun (BToI Int32) = "i32"
     fun (BToI Int64) = "bool_to_i64"
-    fun o = "not_implemented(" <> prettyText o <> ")"
+    -- Float64 conversions are not supported in WGSL
+    fun (FPToUI Float64 _) = f64ConversionError "f64 to unsigned integer"
+    fun (FPToSI Float64 _) = f64ConversionError "f64 to signed integer"
+    fun (UIToFP _ Float64) = f64ConversionError "unsigned integer to f64"
+    fun (SIToFP _ Float64) = f64ConversionError "signed integer to f64"
+    fun (FPConv Float64 _) = f64ConversionError "f64 to other float"
+    fun (FPConv _ Float64) = f64ConversionError "float to f64"
+    -- Catch-all for other unsupported operations
+    fun o =
+      compilerLimitation . T.unlines $
+        [ "WebGPU backend: unsupported type conversion operation: " <> prettyText o,
+          "This conversion is not implemented in the WGSL code generator."
+        ]
+
+    f64ConversionError convDesc =
+      compilerLimitation . T.unlines $
+        [ "WebGPU backend: " <> convDesc <> " conversion not supported.",
+          "WGSL does not support f64 (double precision floating point).",
+          "Consider using f32 instead, or use a different backend (e.g., opencl, cuda)."
+        ]
 
 intLiteral :: IntValue -> WGSL.Exp
 intLiteral (Int8Value v) =
@@ -995,7 +1135,13 @@ handleSpecialFloats s v
 genFloatExp :: FloatValue -> WGSL.Exp
 genFloatExp (Float16Value v) = handleSpecialFloats "f16" (convFloat v)
 genFloatExp (Float32Value v) = handleSpecialFloats "f32" (convFloat v)
-genFloatExp (Float64Value v) = handleSpecialFloats "f64" v
+genFloatExp (Float64Value _) =
+  compilerLimitation . T.unlines $
+    [ "f64 (double precision) literal value encountered in WebGPU backend.",
+      "WGSL only supports f32 (32-bit) and f16 (16-bit) floating point types.",
+      "Consider using f32 instead, or use a different backend (e.g., opencl, cuda) if",
+      "double precision is required."
+    ]
 
 genWGSLExp :: Exp -> KernelM WGSL.Exp
 genWGSLExp (LeafExp name _) = WGSL.VarExp <$> getIdent name
@@ -1003,14 +1149,21 @@ genWGSLExp (ValueExp (IntValue v)) = pure $ intLiteral v
 genWGSLExp (ValueExp (FloatValue v)) = pure $ genFloatExp v
 genWGSLExp (ValueExp (BoolValue v)) = pure $ WGSL.BoolExp v
 genWGSLExp (ValueExp UnitValue) =
-  error "should not attempt to generate unit expressions"
+  compilerBug
+    "WebGPU backend: attempted to generate a unit expression.\n\
+    \Unit values should be eliminated before code generation."
 genWGSLExp (BinOpExp op e1 e2) =
   liftM2 (wgslBinOp op) (genWGSLExp e1) (genWGSLExp e2)
 genWGSLExp (CmpOpExp op e1 e2) =
   liftM2 (wgslCmpOp op) (genWGSLExp e1) (genWGSLExp e2)
 genWGSLExp (UnOpExp op e) = wgslUnOp op <$> genWGSLExp e
 genWGSLExp (ConvOpExp op e) = wgslConvOp op <$> genWGSLExp e
-genWGSLExp e = pure $ WGSL.StringExp $ "<not implemented: " <> prettyText e <> ">"
+genWGSLExp e =
+  compilerLimitation . T.unlines $
+    [ "WebGPU backend: unsupported expression in GPU kernel:",
+      "  " <> prettyText e,
+      "This expression type is not implemented in the WGSL code generator."
+    ]
 
 -- We support 64-bit arithmetic, but since WGSL does not have support for it,
 -- we cannot use a 64-bit value as an index, so we have to truncate it to 32
@@ -1129,11 +1282,25 @@ findSingleMemoryType name = do
           | canBeAtomic prim ->
               if all (\(_, _, s) -> s == sgn) types
                 then pure $ Just (prim, True, sgn)
-                else error "Atomic type used at multiple signednesses"
+                else
+                  compilerLimitation . T.unlines $
+                    [ "WebGPU backend: memory buffer '" <> prettyText name <> "' uses atomic",
+                      "operations with inconsistent signedness.",
+                      "WGSL requires consistent signed/unsigned interpretation for atomic operations."
+                    ]
         Just (t, _, _) ->
-          error $ "Atomics not supported for values of type " <> show t
+          compilerLimitation . T.unlines $
+            [ "WebGPU backend: atomic operations on type '" <> prettyText t <> "' not supported.",
+              "WGSL atomics are only available for 32-bit integers (i32, u32) and floats (f32).",
+              "64-bit atomics are not supported in WGSL."
+            ]
         Nothing -> pure $ Just (prim, False, Signed)
-    _tooMany -> error "Buffer used at multiple types"
+    tooMany ->
+      compilerLimitation . T.unlines $
+        [ "WebGPU backend: memory buffer '" <> prettyText name <> "' accessed at multiple types:",
+          "  " <> T.intercalate ", " (map prettyText tooMany),
+          "WGSL requires each buffer to have a single element type."
+        ]
   where
     canBeAtomic (IntType Int64) = False
     canBeAtomic (IntType _) = True

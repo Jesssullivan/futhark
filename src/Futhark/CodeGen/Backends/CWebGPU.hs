@@ -1,12 +1,50 @@
 {-# LANGUAGE QuasiQuotes #-}
 
--- | Code generation for WebGPU.
+-- |
+-- Module      : Futhark.CodeGen.Backends.CWebGPU
+-- Description : WebGPU backend C and JavaScript code generation
+-- Stability   : experimental
+--
+-- This module generates C code that interfaces with the WebGPU API through
+-- Emscripten's emdawnwebgpu port. It produces output suitable for running
+-- Futhark programs in web browsers via WebAssembly.
+--
+-- == Generated Output
+--
+-- The compilation pipeline produces:
+--
+--   * C code using the WebGPU C API (Dawn) for GPU resource management
+--   * WGSL compute shaders for GPU kernels
+--   * JavaScript wrapper code for browser integration and async operations
+--   * JSON manifest describing entry points, types, and array shapes
+--
+-- == Architecture
+--
+-- The WebGPU backend builds on the generic GPU backend infrastructure:
+--
+--   1. 'Futhark.CodeGen.ImpGen.WebGPU' generates the imperative code with
+--      WebGPU-specific operations
+--   2. This module transforms that into C code with embedded WGSL shaders
+--   3. The JavaScript wrapper provides a high-level async API for browsers
+--
+-- == Usage
+--
+-- The main entry point is 'compileProg', which takes a GPU memory program
+-- and produces C code parts, JavaScript code, and a list of exported symbols.
+--
+-- For server-mode execution (used by @futhark test@), 'asJSServer' generates
+-- a WebSocket-based server script that implements the Futhark server protocol.
 module Futhark.CodeGen.Backends.CWebGPU
-  ( compileProg,
+  ( -- * Compilation
+    compileProg,
+
+    -- * Re-exports from GenericC
     GC.CParts (..),
     GC.asLibrary,
     GC.asExecutable,
     GC.asServer,
+
+    -- * JavaScript server generation
     asJSServer,
   )
 where
@@ -149,17 +187,16 @@ builtinKernels =
             if atomic
               then T.replace "<ELEM_TYPE>" "<atomic<ELEM_TYPE>>" kernel
               else kernel
-       in RTS.wgsl_prelude
-            <> T.replace "NAME" name (T.replace "ELEM_TYPE" elemType baseKernel)
+       in RTS.wgsl_prelude <> T.replace "NAME" name (T.replace "ELEM_TYPE" elemType baseKernel)
 
     generateKernels (template, interface) =
       [ (nameFromText (T.replace "NAME" name template), interface name elemType atomic)
-      | (name, elemType, atomic) <-
-          [ ("1b", "i8", True),
-            ("2b", "i16", True),
-            ("4b", "i32", False),
-            ("8b", "i64", False)
-          ]
+        | (name, elemType, atomic) <-
+            [ ("1b", "i8", True),
+              ("2b", "i16", True),
+              ("4b", "i32", False),
+              ("8b", "i64", False)
+            ]
       ]
 
     transposeInterface program name elemType atomic =
@@ -280,7 +317,7 @@ asyncCall func hasReturn args =
       "[" <> T.intercalate ", " args <> "]"
 
 mkJsContext :: Definitions a -> T.Text -> (T.Text, [T.Text])
-mkJsContext (Definitions _ _ _ (Functions funs)) manifest =
+mkJsContext (Definitions _ _ (Functions funs)) manifest =
   ( [text|
    class FutharkModule {
      ${constructor}
@@ -400,13 +437,14 @@ compileProg ::
   m (ImpGen.Warnings, (GC.CParts, T.Text, [T.Text]))
 compileProg version prog = do
   ( ws,
-    Program wgsl_code wgsl_prelude macros kernels failures prog'
+    Program wgsl_code wgsl_prelude macros kernels params failures prog'
     ) <-
     ImpGen.compileProg prog
   c <-
     GC.compileProg
       "webgpu"
       version
+      params
       operations
       (mkBoilerplate (wgsl_prelude <> wgsl_code) macros kernels [] failures)
       webgpu_includes
@@ -428,7 +466,6 @@ compileProg version prog = do
        #else
          #include <webgpu/webgpu.h>
          #include <emscripten.h>
-         #include <emscripten/html5_webgpu.h>
        #endif
       |]
 

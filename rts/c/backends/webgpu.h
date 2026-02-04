@@ -3,22 +3,138 @@
 // Synchronous wrapper around asynchronous WebGPU APIs, based on looping with
 // emscripten_sleep until the respective callback gets called.
 
+// Helper to convert C strings to WGPUStringView for the new Dawn API.
+static inline WGPUStringView wgpu_str(const char *s) {
+  WGPUStringView sv = { .data = s, .length = s ? strlen(s) : 0 };
+  return sv;
+}
+
+// ============================================================================
+// Error Message Helpers
+// ============================================================================
+
+// Convert WGPUErrorType to human-readable string.
+static const char* wgpu_error_type_str(WGPUErrorType type) {
+  switch (type) {
+    case WGPUErrorType_NoError: return "NoError";
+    case WGPUErrorType_Validation: return "Validation";
+    case WGPUErrorType_OutOfMemory: return "OutOfMemory";
+    case WGPUErrorType_Internal: return "Internal";
+    case WGPUErrorType_Unknown: return "Unknown";
+    case WGPUErrorType_DeviceLost: return "DeviceLost";
+    default: return "Unrecognized";
+  }
+}
+
+// Convert WGPUMapAsyncStatus to human-readable string.
+static const char* wgpu_map_status_str(WGPUMapAsyncStatus status) {
+  switch (status) {
+    case WGPUMapAsyncStatus_Success: return "Success";
+    case WGPUMapAsyncStatus_InstanceDropped: return "InstanceDropped";
+    case WGPUMapAsyncStatus_Error: return "Error";
+    case WGPUMapAsyncStatus_Aborted: return "Aborted";
+    case WGPUMapAsyncStatus_Unknown: return "Unknown";
+    default: return "Unrecognized";
+  }
+}
+
+// Convert WGPURequestAdapterStatus to human-readable string.
+static const char* wgpu_adapter_status_str(WGPURequestAdapterStatus status) {
+  switch (status) {
+    case WGPURequestAdapterStatus_Success: return "Success";
+    case WGPURequestAdapterStatus_InstanceDropped: return "InstanceDropped";
+    case WGPURequestAdapterStatus_Unavailable: return "Unavailable";
+    case WGPURequestAdapterStatus_Error: return "Error";
+    case WGPURequestAdapterStatus_Unknown: return "Unknown";
+    default: return "Unrecognized";
+  }
+}
+
+// Convert WGPURequestDeviceStatus to human-readable string.
+static const char* wgpu_device_status_str(WGPURequestDeviceStatus status) {
+  switch (status) {
+    case WGPURequestDeviceStatus_Success: return "Success";
+    case WGPURequestDeviceStatus_InstanceDropped: return "InstanceDropped";
+    case WGPURequestDeviceStatus_Error: return "Error";
+    case WGPURequestDeviceStatus_Unknown: return "Unknown";
+    default: return "Unrecognized";
+  }
+}
+
+// Convert WGPUQueueWorkDoneStatus to human-readable string.
+static const char* wgpu_queue_status_str(WGPUQueueWorkDoneStatus status) {
+  switch (status) {
+    case WGPUQueueWorkDoneStatus_Success: return "Success";
+    case WGPUQueueWorkDoneStatus_InstanceDropped: return "InstanceDropped";
+    case WGPUQueueWorkDoneStatus_Error: return "Error";
+    default: return "Unrecognized";
+  }
+}
+
+// Convert WGPUCompilationMessageType to human-readable string.
+static const char* wgpu_compilation_msg_type_str(WGPUCompilationMessageType type) {
+  switch (type) {
+    case WGPUCompilationMessageType_Error: return "Error";
+    case WGPUCompilationMessageType_Warning: return "Warning";
+    case WGPUCompilationMessageType_Info: return "Info";
+    default: return "Unknown";
+  }
+}
+
+// Convert WGPUCompilationInfoRequestStatus to human-readable string.
+static const char* wgpu_compilation_status_str(WGPUCompilationInfoRequestStatus status) {
+  switch (status) {
+    case WGPUCompilationInfoRequestStatus_Success: return "Success";
+    case WGPUCompilationInfoRequestStatus_InstanceDropped: return "InstanceDropped";
+    case WGPUCompilationInfoRequestStatus_Error: return "Error";
+    default: return "Unrecognized";
+  }
+}
+
+// Format a size in bytes to a human-readable string.
+static void wgpu_format_size(size_t bytes, char *buf, size_t buf_size) {
+  if (bytes >= 1024 * 1024 * 1024) {
+    snprintf(buf, buf_size, "%.2f GiB (%zu bytes)", (double)bytes / (1024 * 1024 * 1024), bytes);
+  } else if (bytes >= 1024 * 1024) {
+    snprintf(buf, buf_size, "%.2f MiB (%zu bytes)", (double)bytes / (1024 * 1024), bytes);
+  } else if (bytes >= 1024) {
+    snprintf(buf, buf_size, "%.2f KiB (%zu bytes)", (double)bytes / 1024, bytes);
+  } else {
+    snprintf(buf, buf_size, "%zu bytes", bytes);
+  }
+}
+
+// ============================================================================
+// End Error Message Helpers
+// ============================================================================
+
 typedef struct wgpu_wait_info {
   bool released;
   void *result;
 } wgpu_wait_info;
 
-void wgpu_map_sync_callback(WGPUBufferMapAsyncStatus status, void *info_v) {
-  wgpu_wait_info *info = (wgpu_wait_info *)info_v;
-  *((WGPUBufferMapAsyncStatus *) info->result) = status;
+void wgpu_map_sync_callback(WGPUMapAsyncStatus status,
+                            WGPUStringView message,
+                            void *userdata1, void *userdata2) {
+  (void)userdata2;
+  wgpu_wait_info *info = (wgpu_wait_info *)userdata1;
+  *((WGPUMapAsyncStatus *) info->result) = status;
   info->released = true;
+
+  // Log mapping failures with context.
+  if (status != WGPUMapAsyncStatus_Success && message.length > 0) {
+    fprintf(stderr, "WebGPU buffer mapping failed: %s\n"
+                    "  Message: %.*s\n",
+            wgpu_map_status_str(status),
+            (int)message.length, message.data);
+  }
 }
 
-WGPUBufferMapAsyncStatus wgpu_map_buffer_sync(WGPUInstance instance,
-                                              WGPUBuffer buffer,
-                                              WGPUMapModeFlags mode,
-                                              size_t offset, size_t size) {
-  WGPUBufferMapAsyncStatus status;
+WGPUMapAsyncStatus wgpu_map_buffer_sync(WGPUInstance instance,
+                                        WGPUBuffer buffer,
+                                        WGPUMapMode mode,
+                                        size_t offset, size_t size) {
+  WGPUMapAsyncStatus status;
   wgpu_wait_info info = {
     .released = false,
     .result = (void *)&status,
@@ -28,7 +144,8 @@ WGPUBufferMapAsyncStatus wgpu_map_buffer_sync(WGPUInstance instance,
   WGPUBufferMapCallbackInfo cb_info = {
     .mode = WGPUCallbackMode_WaitAnyOnly,
     .callback = wgpu_map_sync_callback,
-    .userdata = (void *) &info,
+    .userdata1 = (void *) &info,
+    .userdata2 = NULL,
   };
   WGPUFuture f = wgpuBufferMapAsyncF(buffer, mode, offset, size, cb_info);
   WGPUFutureWaitInfo f_info = { .future = f };
@@ -36,8 +153,13 @@ WGPUBufferMapAsyncStatus wgpu_map_buffer_sync(WGPUInstance instance,
     wgpuInstanceWaitAny(instance, 1, &f_info, 0);
   }
 #else
-  wgpuBufferMapAsync(buffer, mode, offset, size,
-                     wgpu_map_sync_callback, (void *) &info);
+  WGPUBufferMapCallbackInfo cb_info = {
+    .mode = WGPUCallbackMode_AllowSpontaneous,
+    .callback = wgpu_map_sync_callback,
+    .userdata1 = (void *) &info,
+    .userdata2 = NULL,
+  };
+  wgpuBufferMapAsync(buffer, mode, offset, size, cb_info);
 
   // TODO: Should this do some kind of volatile load?
   // (Same for other _sync wrappers below.)
@@ -52,13 +174,15 @@ WGPUBufferMapAsyncStatus wgpu_map_buffer_sync(WGPUInstance instance,
 typedef struct wgpu_request_adapter_result {
   WGPURequestAdapterStatus status;
   WGPUAdapter adapter;
-  const char *message;
+  WGPUStringView message;
 } wgpu_request_adapter_result;
 
 void wgpu_request_adapter_callback(WGPURequestAdapterStatus status,
                                    WGPUAdapter adapter,
-                                   const char *message, void *userdata) {
-  wgpu_wait_info *info = (wgpu_wait_info *)userdata;
+                                   WGPUStringView message,
+                                   void *userdata1, void *userdata2) {
+  (void)userdata2;
+  wgpu_wait_info *info = (wgpu_wait_info *)userdata1;
   wgpu_request_adapter_result *result
     = (wgpu_request_adapter_result *)info->result;
   result->status = status;
@@ -79,7 +203,8 @@ wgpu_request_adapter_result wgpu_request_adapter_sync(
   WGPURequestAdapterCallbackInfo cb_info = {
     .mode = WGPUCallbackMode_WaitAnyOnly,
     .callback = wgpu_request_adapter_callback,
-    .userdata = (void *) &info,
+    .userdata1 = (void *) &info,
+    .userdata2 = NULL,
   };
   WGPUFuture f = wgpuInstanceRequestAdapterF(instance, options, cb_info);
   WGPUFutureWaitInfo f_info = { .future = f };
@@ -87,8 +212,13 @@ wgpu_request_adapter_result wgpu_request_adapter_sync(
     wgpuInstanceWaitAny(instance, 1, &f_info, 0);
   }
 #else
-  wgpuInstanceRequestAdapter(instance, options, wgpu_request_adapter_callback,
-                             (void *)&info);
+  WGPURequestAdapterCallbackInfo cb_info = {
+    .mode = WGPUCallbackMode_AllowSpontaneous,
+    .callback = wgpu_request_adapter_callback,
+    .userdata1 = (void *) &info,
+    .userdata2 = NULL,
+  };
+  wgpuInstanceRequestAdapter(instance, options, cb_info);
 
   while (!info.released) {
     emscripten_sleep(0);
@@ -101,13 +231,15 @@ wgpu_request_adapter_result wgpu_request_adapter_sync(
 typedef struct wgpu_request_device_result {
   WGPURequestDeviceStatus status;
   WGPUDevice device;
-  const char *message;
+  WGPUStringView message;
 } wgpu_request_device_result;
 
 void wgpu_request_device_callback(WGPURequestDeviceStatus status,
-                                   WGPUDevice device,
-                                   const char *message, void *userdata) {
-  wgpu_wait_info *info = (wgpu_wait_info *)userdata;
+                                  WGPUDevice device,
+                                  WGPUStringView message,
+                                  void *userdata1, void *userdata2) {
+  (void)userdata2;
+  wgpu_wait_info *info = (wgpu_wait_info *)userdata1;
   wgpu_request_device_result *result
     = (wgpu_request_device_result *)info->result;
   result->status = status;
@@ -131,7 +263,8 @@ wgpu_request_device_result wgpu_request_device_sync(
   WGPURequestDeviceCallbackInfo cb_info = {
     .mode = WGPUCallbackMode_WaitAnyOnly,
     .callback = wgpu_request_device_callback,
-    .userdata = (void *) &info,
+    .userdata1 = (void *) &info,
+    .userdata2 = NULL,
   };
   WGPUFuture f = wgpuAdapterRequestDeviceF(adapter, descriptor, cb_info);
   WGPUFutureWaitInfo f_info = { .future = f };
@@ -139,8 +272,13 @@ wgpu_request_device_result wgpu_request_device_sync(
     wgpuInstanceWaitAny(instance, 1, &f_info, 0);
   }
 #else
-  wgpuAdapterRequestDevice(adapter, descriptor, wgpu_request_device_callback,
-                           (void *)&info);
+  WGPURequestDeviceCallbackInfo cb_info = {
+    .mode = WGPUCallbackMode_AllowSpontaneous,
+    .callback = wgpu_request_device_callback,
+    .userdata1 = (void *) &info,
+    .userdata2 = NULL,
+  };
+  wgpuAdapterRequestDevice(adapter, descriptor, cb_info);
 
   while (!info.released) {
     emscripten_sleep(0);
@@ -151,8 +289,9 @@ wgpu_request_device_result wgpu_request_device_sync(
 }
 
 void wgpu_on_work_done_callback(WGPUQueueWorkDoneStatus status,
-                                void *userdata) {
-  wgpu_wait_info *info = (wgpu_wait_info *)userdata;
+                                void *userdata1, void *userdata2) {
+  (void)userdata2;
+  wgpu_wait_info *info = (wgpu_wait_info *)userdata1;
   *((WGPUQueueWorkDoneStatus *)info->result) = status;
   info->released = true;
 }
@@ -170,7 +309,8 @@ WGPUQueueWorkDoneStatus wgpu_block_until_work_done(WGPUInstance instance,
   WGPUQueueWorkDoneCallbackInfo cb_info = {
     .mode = WGPUCallbackMode_WaitAnyOnly,
     .callback = wgpu_on_work_done_callback,
-    .userdata = (void *) &info,
+    .userdata1 = (void *) &info,
+    .userdata2 = NULL,
   };
   WGPUFuture f = wgpuQueueOnSubmittedWorkDoneF(queue, cb_info);
   WGPUFutureWaitInfo f_info = { .future = f };
@@ -178,7 +318,13 @@ WGPUQueueWorkDoneStatus wgpu_block_until_work_done(WGPUInstance instance,
     wgpuInstanceWaitAny(instance, 1, &f_info, 0);
   }
 #else
-  wgpuQueueOnSubmittedWorkDone(queue, wgpu_on_work_done_callback, (void *)&info);
+  WGPUQueueWorkDoneCallbackInfo cb_info = {
+    .mode = WGPUCallbackMode_AllowSpontaneous,
+    .callback = wgpu_on_work_done_callback,
+    .userdata1 = (void *) &info,
+    .userdata2 = NULL,
+  };
+  wgpuQueueOnSubmittedWorkDone(queue, cb_info);
 
   while (!info.released) {
     emscripten_sleep(0);
@@ -188,18 +334,131 @@ WGPUQueueWorkDoneStatus wgpu_block_until_work_done(WGPUInstance instance,
   return status;
 }
 
-void wgpu_on_uncaptured_error(WGPUErrorType error_type, const char *msg,
-                              void *userdata) {
-  futhark_panic(-1, "Uncaptured WebGPU error, type: %d\n%s\n", error_type, msg);
+void wgpu_on_uncaptured_error(WGPUDevice const *device,
+                              WGPUErrorType error_type,
+                              WGPUStringView message,
+                              void *userdata1, void *userdata2) {
+  (void)device;
+  (void)userdata1;
+  (void)userdata2;
+
+  const char *type_str = wgpu_error_type_str(error_type);
+  const char *hint = "";
+
+  // Provide actionable hints based on error type.
+  switch (error_type) {
+    case WGPUErrorType_Validation:
+      hint = "  Hint: Check shader code for type mismatches, binding errors, or invalid operations.\n";
+      break;
+    case WGPUErrorType_OutOfMemory:
+      hint = "  Hint: Reduce data sizes, free unused buffers, or use smaller workgroup sizes.\n"
+             "        Consider breaking large operations into smaller batches.\n";
+      break;
+    case WGPUErrorType_DeviceLost:
+      hint = "  Hint: The GPU device was lost (possibly due to driver crash, timeout, or power event).\n"
+             "        The application must be restarted to recover.\n";
+      break;
+    case WGPUErrorType_Internal:
+      hint = "  Hint: This is a WebGPU implementation bug. Please report this issue.\n";
+      break;
+    default:
+      break;
+  }
+
+  futhark_panic(-1,
+    "===========================================================================\n"
+    "WebGPU Uncaptured Error\n"
+    "===========================================================================\n"
+    "  Error Type: %s (code %d)\n"
+    "  Message: %.*s\n"
+    "%s"
+    "===========================================================================\n",
+    type_str, error_type,
+    (int)message.length, message.data,
+    hint);
 }
+
+// Structure to track shader compilation state for better error reporting.
+typedef struct wgpu_shader_compile_state {
+  const char *shader_label;
+  bool has_errors;
+} wgpu_shader_compile_state;
 
 void wgpu_on_shader_compiled(WGPUCompilationInfoRequestStatus status,
                              struct WGPUCompilationInfo const * compilationInfo,
-                             void * userdata) {
-  // TODO: Check status, better printing
-  for (int i = 0; i < compilationInfo->messageCount; i++) {
+                             void * userdata1, void * userdata2) {
+  (void)userdata2;
+  wgpu_shader_compile_state *state = (wgpu_shader_compile_state *)userdata1;
+  const char *shader_label = state ? state->shader_label : "unknown";
+
+  // Check compilation info request status.
+  if (status != WGPUCompilationInfoRequestStatus_Success) {
+    fprintf(stderr,
+      "WebGPU shader compilation info request failed for '%s': %s\n",
+      shader_label, wgpu_compilation_status_str(status));
+    return;
+  }
+
+  if (compilationInfo->messageCount == 0) {
+    return; // No messages - compilation succeeded silently.
+  }
+
+  // Count errors vs warnings for summary.
+  size_t error_count = 0;
+  size_t warning_count = 0;
+  size_t info_count = 0;
+
+  for (size_t i = 0; i < compilationInfo->messageCount; i++) {
+    switch (compilationInfo->messages[i].type) {
+      case WGPUCompilationMessageType_Error: error_count++; break;
+      case WGPUCompilationMessageType_Warning: warning_count++; break;
+      case WGPUCompilationMessageType_Info: info_count++; break;
+      default: break;
+    }
+  }
+
+  // Print header.
+  fprintf(stderr,
+    "===========================================================================\n"
+    "WGSL Shader Compilation Report: '%s'\n"
+    "  %zu error(s), %zu warning(s), %zu info message(s)\n"
+    "===========================================================================\n",
+    shader_label, error_count, warning_count, info_count);
+
+  // Print each message with location information.
+  for (size_t i = 0; i < compilationInfo->messageCount; i++) {
     WGPUCompilationMessage msg = compilationInfo->messages[i];
-    printf("Shader compilation message: %s\n", msg.message);
+    const char *type_str = wgpu_compilation_msg_type_str(msg.type);
+
+    // Print message header with type and location.
+    if (msg.lineNum > 0) {
+      fprintf(stderr, "[%s] Line %llu", type_str, (unsigned long long)msg.lineNum);
+      if (msg.linePos > 0) {
+        fprintf(stderr, ", Column %llu", (unsigned long long)msg.linePos);
+      }
+      fprintf(stderr, ":\n");
+    } else {
+      fprintf(stderr, "[%s]:\n", type_str);
+    }
+
+    // Print the actual message.
+    fprintf(stderr, "  %.*s\n", (int)msg.message.length, msg.message.data);
+
+    // Print offset information if available (for programmatic use).
+    if (msg.offset > 0 || msg.length > 0) {
+      fprintf(stderr, "  (offset: %llu, length: %llu)\n",
+              (unsigned long long)msg.offset, (unsigned long long)msg.length);
+    }
+
+    fprintf(stderr, "\n");
+  }
+
+  fprintf(stderr,
+    "===========================================================================\n");
+
+  // Track if there were errors.
+  if (state && error_count > 0) {
+    state->has_errors = true;
   }
 }
 
@@ -303,13 +562,40 @@ struct futhark_context {
 };
 
 int futhark_context_sync(struct futhark_context *ctx) {
-  // TODO: All the error handling stuff.
+  if (ctx->debugging) {
+    fprintf(ctx->log, "[WebGPU DEBUG] Synchronizing context (waiting for queue work done)...\n");
+  }
+
   WGPUQueueWorkDoneStatus status = wgpu_block_until_work_done(ctx->instance,
                                                               ctx->queue);
   if (status != WGPUQueueWorkDoneStatus_Success) {
-    futhark_panic(-1, "Failed to wait for work to be done, status: %d\n",
-                  status);
+    const char *status_str = wgpu_queue_status_str(status);
+    const char *hint = "";
+
+    switch (status) {
+      case WGPUQueueWorkDoneStatus_Error:
+        hint = "  Hint: A GPU error occurred during command execution.\n"
+               "        Check for shader errors or invalid buffer operations.\n";
+        break;
+      case WGPUQueueWorkDoneStatus_InstanceDropped:
+        hint = "  Hint: The WebGPU instance was dropped unexpectedly.\n"
+               "        This may indicate a context or page lifecycle issue.\n";
+        break;
+      default:
+        break;
+    }
+
+    futhark_panic(-1,
+      "WebGPU error in futhark_context_sync: Failed to wait for queue work\n"
+      "  Status: %s (code %d)\n"
+      "%s",
+      status_str, status, hint);
   }
+
+  if (ctx->debugging) {
+    fprintf(ctx->log, "[WebGPU DEBUG] Context synchronized successfully.\n");
+  }
+
   return FUTHARK_SUCCESS;
 }
 
@@ -370,19 +656,46 @@ static void wgpu_size_setup(struct futhark_context *ctx) {
 }
 
 void wgpu_module_setup(struct futhark_context *ctx, const char *program, WGPUShaderModule *module, const char* label) {
-  WGPUShaderModuleWGSLDescriptor wgsl_desc = {
+  if (ctx->debugging) {
+    fprintf(ctx->log, "[WebGPU DEBUG] Compiling shader module '%s'...\n", label);
+  }
+
+  WGPUShaderSourceWGSL wgsl_desc = {
     .chain = {
-      .sType = WGPUSType_ShaderModuleWGSLDescriptor
+      .sType = WGPUSType_ShaderSourceWGSL
     },
-    .code = program
+    .code = wgpu_str(program)
   };
   WGPUShaderModuleDescriptor desc = {
-    .label = label,
+    .label = wgpu_str(label),
     .nextInChain = &wgsl_desc.chain
   };
   *module = wgpuDeviceCreateShaderModule(ctx->device, &desc);
 
-  wgpuShaderModuleGetCompilationInfo(*module, wgpu_on_shader_compiled, NULL);
+  if (*module == NULL) {
+    futhark_panic(-1,
+      "WebGPU error in wgpu_module_setup: Failed to create shader module '%s'\n"
+      "  Hint: Check that the WGSL source is valid and the device supports required features.\n",
+      label);
+  }
+
+  if (ctx->debugging) {
+    fprintf(ctx->log, "[WebGPU DEBUG] Shader module '%s' created, fetching compilation info...\n", label);
+  }
+
+  // Set up compilation state for error tracking.
+  wgpu_shader_compile_state compile_state = {
+    .shader_label = label,
+    .has_errors = false,
+  };
+
+  WGPUCompilationInfoCallbackInfo cb_info = {
+    .mode = WGPUCallbackMode_AllowSpontaneous,
+    .callback = wgpu_on_shader_compiled,
+    .userdata1 = &compile_state,
+    .userdata2 = NULL,
+  };
+  wgpuShaderModuleGetCompilationInfo(*module, cb_info);
 }
 
 struct builtin_kernels* init_builtin_kernels(struct futhark_context* ctx);
@@ -411,81 +724,163 @@ int backend_context_setup(struct futhark_context *ctx) {
   // be a way to get L2 cache size from the WebGPU API.
   ctx->max_cache = 2097152;
 
+  if (ctx->debugging) {
+    fprintf(ctx->log, "[WebGPU DEBUG] Initializing WebGPU backend...\n");
+  }
+
   ctx->instance = wgpuCreateInstance(NULL);
+
+  if (ctx->debugging) {
+    fprintf(ctx->log, "[WebGPU DEBUG] WebGPU instance created, requesting adapter...\n");
+  }
 
   wgpu_request_adapter_result adapter_result
     = wgpu_request_adapter_sync(ctx->instance, NULL);
   if (adapter_result.status != WGPURequestAdapterStatus_Success) {
-    if (adapter_result.message != NULL) {
-      futhark_panic(-1, "Could not get WebGPU adapter, status: %d\nMessage: %s\n",
-                    adapter_result.status, adapter_result.message);
+    const char *status_str = wgpu_adapter_status_str(adapter_result.status);
+    const char *hint = "";
+
+    switch (adapter_result.status) {
+      case WGPURequestAdapterStatus_Unavailable:
+        hint = "  Hint: No compatible GPU adapter found. Ensure:\n"
+               "        - WebGPU is supported by your browser/runtime\n"
+               "        - GPU drivers are up to date\n"
+               "        - Hardware acceleration is enabled\n";
+        break;
+      case WGPURequestAdapterStatus_Error:
+        hint = "  Hint: An error occurred while requesting the adapter.\n"
+               "        Check browser console for additional details.\n";
+        break;
+      case WGPURequestAdapterStatus_InstanceDropped:
+        hint = "  Hint: The WebGPU instance was dropped before adapter request completed.\n";
+        break;
+      default:
+        break;
+    }
+
+    if (adapter_result.message.data != NULL && adapter_result.message.length > 0) {
+      futhark_panic(-1,
+        "WebGPU error in backend_context_setup: Failed to get adapter\n"
+        "  Status: %s (code %d)\n"
+        "  Message: %.*s\n"
+        "%s",
+        status_str, adapter_result.status,
+        (int)adapter_result.message.length, adapter_result.message.data,
+        hint);
     } else {
-      futhark_panic(-1, "Could not get WebGPU adapter, status: %d\n",
-                    adapter_result.status);
+      futhark_panic(-1,
+        "WebGPU error in backend_context_setup: Failed to get adapter\n"
+        "  Status: %s (code %d)\n"
+        "%s",
+        status_str, adapter_result.status,
+        hint);
     }
   }
   ctx->adapter = adapter_result.adapter;
 
+  if (ctx->debugging) {
+    fprintf(ctx->log, "[WebGPU DEBUG] Adapter acquired successfully.\n");
+  }
+
   // We want to request the max limits possible.
   // Some limits, like maxStorageBuffersPerShaderStage has a huge impact
   // on what programs we can run, so we need to request the maximum possible.
-  WGPUSupportedLimits supported;
-  WGPUBool res = wgpuAdapterGetLimits(ctx->adapter, &supported);
-  if (!res) {
-    futhark_panic(-1, "Could not get WebGPU adapter limits\n", res);
+  WGPULimits supported = {0};
+  WGPUStatus res = wgpuAdapterGetLimits(ctx->adapter, &supported);
+  if (res != WGPUStatus_Success) {
+    futhark_panic(-1,
+      "WebGPU error in backend_context_setup: Failed to get adapter limits\n"
+      "  Status code: %d\n"
+      "  Hint: The adapter may have been lost or is in an invalid state.\n",
+      res);
   }
-  WGPURequiredLimits required_limits;
+  WGPULimits required_limits;
   // If we just zero this memory, stuff crashes in the generated empscripten js.
   // For some reason, we have to set it to all 1s?
-  memset((void*)&required_limits.limits, 0xff, sizeof(required_limits.limits));
-  required_limits.limits.maxBindGroups = supported.limits.maxBindGroups;
-  required_limits.limits.maxBindingsPerBindGroup = supported.limits.maxBindingsPerBindGroup;
-  required_limits.limits.maxDynamicUniformBuffersPerPipelineLayout = supported.limits.maxDynamicUniformBuffersPerPipelineLayout;
-  required_limits.limits.maxDynamicStorageBuffersPerPipelineLayout = supported.limits.maxDynamicStorageBuffersPerPipelineLayout;
-  required_limits.limits.maxStorageBuffersPerShaderStage = supported.limits.maxStorageBuffersPerShaderStage;
-  required_limits.limits.maxUniformBuffersPerShaderStage = supported.limits.maxUniformBuffersPerShaderStage;
-  required_limits.limits.maxUniformBufferBindingSize = supported.limits.maxUniformBufferBindingSize;
-  required_limits.limits.maxStorageBufferBindingSize = supported.limits.maxStorageBufferBindingSize;
-  required_limits.limits.maxBufferSize = supported.limits.maxBufferSize;
-  required_limits.limits.maxComputeWorkgroupStorageSize = supported.limits.maxComputeWorkgroupStorageSize;
-  required_limits.limits.maxComputeInvocationsPerWorkgroup = supported.limits.maxComputeInvocationsPerWorkgroup;
-  required_limits.limits.maxComputeWorkgroupSizeX = supported.limits.maxComputeWorkgroupSizeX;
-  required_limits.limits.maxComputeWorkgroupSizeY = supported.limits.maxComputeWorkgroupSizeY;
-  required_limits.limits.maxComputeWorkgroupSizeZ = supported.limits.maxComputeWorkgroupSizeZ;
-  required_limits.limits.maxComputeWorkgroupsPerDimension = supported.limits.maxComputeWorkgroupsPerDimension;
+  memset((void*)&required_limits, 0xff, sizeof(required_limits));
+  required_limits.maxBindGroups = supported.maxBindGroups;
+  required_limits.maxBindingsPerBindGroup = supported.maxBindingsPerBindGroup;
+  required_limits.maxDynamicUniformBuffersPerPipelineLayout = supported.maxDynamicUniformBuffersPerPipelineLayout;
+  required_limits.maxDynamicStorageBuffersPerPipelineLayout = supported.maxDynamicStorageBuffersPerPipelineLayout;
+  required_limits.maxStorageBuffersPerShaderStage = supported.maxStorageBuffersPerShaderStage;
+  required_limits.maxUniformBuffersPerShaderStage = supported.maxUniformBuffersPerShaderStage;
+  required_limits.maxUniformBufferBindingSize = supported.maxUniformBufferBindingSize;
+  required_limits.maxStorageBufferBindingSize = supported.maxStorageBufferBindingSize;
+  required_limits.maxBufferSize = supported.maxBufferSize;
+  required_limits.maxComputeWorkgroupStorageSize = supported.maxComputeWorkgroupStorageSize;
+  required_limits.maxComputeInvocationsPerWorkgroup = supported.maxComputeInvocationsPerWorkgroup;
+  required_limits.maxComputeWorkgroupSizeX = supported.maxComputeWorkgroupSizeX;
+  required_limits.maxComputeWorkgroupSizeY = supported.maxComputeWorkgroupSizeY;
+  required_limits.maxComputeWorkgroupSizeZ = supported.maxComputeWorkgroupSizeZ;
+  required_limits.maxComputeWorkgroupsPerDimension = supported.maxComputeWorkgroupsPerDimension;
 
   // Require support for 16-bit floats
   WGPUFeatureName required_features[] = { WGPUFeatureName_ShaderF16 };
   WGPUDeviceDescriptor device_desc = {
     .requiredFeatureCount = 1,
     .requiredFeatures = required_features,
-    .requiredLimits = &required_limits
+    .requiredLimits = &required_limits,
+    // Set uncaptured error callback at device creation time (new Dawn API)
+    .uncapturedErrorCallbackInfo = {
+      .callback = wgpu_on_uncaptured_error,
+      .userdata1 = ctx,
+      .userdata2 = NULL,
+    },
   };
   wgpu_request_device_result device_result
     = wgpu_request_device_sync(ctx->instance, ctx->adapter, &device_desc);
   if (device_result.status != WGPURequestDeviceStatus_Success) {
-    if (device_result.message != NULL) {
-      futhark_panic(-1, "Could not get WebGPU device, status: %d\nMessage: %s\n",
-                    device_result.status, device_result.message);
+    const char *status_str = wgpu_device_status_str(device_result.status);
+    const char *hint =
+      "  Hint: The device request failed. This could be due to:\n"
+      "        - Unsupported required features (e.g., ShaderF16)\n"
+      "        - Requested limits exceeding adapter capabilities\n"
+      "        - GPU driver or browser issues\n";
+
+    if (device_result.message.data != NULL && device_result.message.length > 0) {
+      futhark_panic(-1,
+        "WebGPU error in backend_context_setup: Failed to get device\n"
+        "  Status: %s (code %d)\n"
+        "  Message: %.*s\n"
+        "%s",
+        status_str, device_result.status,
+        (int)device_result.message.length, device_result.message.data,
+        hint);
     } else {
-      futhark_panic(-1, "Could not get WebGPU device, status: %d\n",
-                    device_result.status);
+      futhark_panic(-1,
+        "WebGPU error in backend_context_setup: Failed to get device\n"
+        "  Status: %s (code %d)\n"
+        "%s",
+        status_str, device_result.status,
+        hint);
     }
   }
   ctx->device = device_result.device;
-  wgpuDeviceSetUncapturedErrorCallback(ctx->device,
-                                       wgpu_on_uncaptured_error, NULL);
+
+  if (ctx->debugging) {
+    fprintf(ctx->log, "[WebGPU DEBUG] Device acquired successfully.\n");
+    fprintf(ctx->log, "[WebGPU DEBUG] Device limits:\n");
+    fprintf(ctx->log, "[WebGPU DEBUG]   maxStorageBuffersPerShaderStage: %u\n", supported.maxStorageBuffersPerShaderStage);
+    fprintf(ctx->log, "[WebGPU DEBUG]   maxStorageBufferBindingSize: %llu\n", (unsigned long long)supported.maxStorageBufferBindingSize);
+    fprintf(ctx->log, "[WebGPU DEBUG]   maxBufferSize: %llu\n", (unsigned long long)supported.maxBufferSize);
+    fprintf(ctx->log, "[WebGPU DEBUG]   maxComputeWorkgroupStorageSize: %u\n", supported.maxComputeWorkgroupStorageSize);
+    fprintf(ctx->log, "[WebGPU DEBUG]   maxComputeInvocationsPerWorkgroup: %u\n", supported.maxComputeInvocationsPerWorkgroup);
+    fprintf(ctx->log, "[WebGPU DEBUG]   maxComputeWorkgroupSizeX: %u\n", supported.maxComputeWorkgroupSizeX);
+    fprintf(ctx->log, "[WebGPU DEBUG]   maxComputeWorkgroupSizeY: %u\n", supported.maxComputeWorkgroupSizeY);
+    fprintf(ctx->log, "[WebGPU DEBUG]   maxComputeWorkgroupSizeZ: %u\n", supported.maxComputeWorkgroupSizeZ);
+    fprintf(ctx->log, "[WebGPU DEBUG]   maxComputeWorkgroupsPerDimension: %u\n", supported.maxComputeWorkgroupsPerDimension);
+  }
 
   ctx->queue = wgpuDeviceGetQueue(ctx->device);
 
   wgpu_size_setup(ctx);
 
-  WGPUBufferDescriptor desc = {
-    .label = "scalar_readback",
+  WGPUBufferDescriptor scalar_buf_desc = {
+    .label = wgpu_str("scalar_readback"),
     .size = 8,
     .usage = WGPUBufferUsage_MapRead | WGPUBufferUsage_CopyDst,
   };
-  ctx->scalar_readback_buffer = wgpuDeviceCreateBuffer(ctx->device, &desc);
+  ctx->scalar_readback_buffer = wgpuDeviceCreateBuffer(ctx->device, &scalar_buf_desc);
   free_list_init(&ctx->gpu_free_list);
 
   // We implement macros as override constants.
@@ -498,11 +893,24 @@ int backend_context_setup(struct futhark_context *ctx) {
   }
   free(macro_vals);
 
+  if (ctx->debugging) {
+    fprintf(ctx->log, "[WebGPU DEBUG] Compiling main shader module...\n");
+  }
+
   wgpu_module_setup(ctx, ctx->cfg->program, &ctx->module, "Futhark program");
+
+  if (ctx->debugging) {
+    fprintf(ctx->log, "[WebGPU DEBUG] Shader module compiled successfully.\n");
+    fprintf(ctx->log, "[WebGPU DEBUG] Initializing builtin kernels...\n");
+  }
 
   if ((ctx->kernels = init_builtin_kernels(ctx)) == NULL) {
     printf("Failed to init builtin kernels\n");
     return 1;
+  }
+
+  if (ctx->debugging) {
+    fprintf(ctx->log, "[WebGPU DEBUG] WebGPU backend initialized successfully.\n");
   }
 
   return 0;
@@ -592,9 +1000,17 @@ typedef WGPUBuffer gpu_mem;
 
 static int gpu_alloc_actual(struct futhark_context *ctx,
   size_t size, gpu_mem *mem_out) {
-  // Storage buffers bindings must have an effective size that is amultiple of
+  // Storage buffer bindings must have an effective size that is a multiple of
   // 4, so we round up all allocations.
+  size_t original_size = size;
   size = ((size + 4 - 1) / 4) * 4;
+
+  if (ctx->debugging) {
+    char size_str[64];
+    wgpu_format_size(size, size_str, sizeof(size_str));
+    fprintf(ctx->log, "[WebGPU DEBUG] Allocating buffer: %s (storage)\n", size_str);
+  }
+
   WGPUBufferDescriptor desc = {
     .size = size,
     .usage = WGPUBufferUsage_CopySrc
@@ -602,11 +1018,39 @@ static int gpu_alloc_actual(struct futhark_context *ctx,
     | WGPUBufferUsage_Storage,
   };
   *mem_out = wgpuDeviceCreateBuffer(ctx->device, &desc);
-  return FUTHARK_SUCCESS;
+
+  if (*mem_out == NULL) {
+    char size_str[64];
+    wgpu_format_size(size, size_str, sizeof(size_str));
+    futhark_panic(-1,
+      "WebGPU error in gpu_alloc_actual: Failed to create buffer\n"
+      "  Requested size: %s\n"
+      "  Original request: %zu bytes (padded to %zu for alignment)\n"
+      "  Current GPU memory usage: %lld bytes\n"
+      "  Peak GPU memory usage: %lld bytes\n"
+      "  Hint: The device may be out of memory. Try:\n"
+      "        - Reducing input data sizes\n"
+      "        - Freeing unused arrays\n"
+      "        - Breaking computation into smaller batches\n",
+      size_str, original_size, size,
+      (long long)ctx->cur_mem_usage_device,
+      (long long)ctx->peak_mem_usage_device);
   }
 
-  static int gpu_free_actual(struct futhark_context *ctx, gpu_mem mem) {
-  (void)ctx;
+  if (ctx->debugging) {
+    fprintf(ctx->log, "[WebGPU DEBUG] Buffer allocated successfully.\n");
+  }
+
+  return FUTHARK_SUCCESS;
+}
+
+static int gpu_free_actual(struct futhark_context *ctx, gpu_mem mem) {
+  if (ctx->debugging) {
+    uint64_t buf_size = wgpuBufferGetSize(mem);
+    char size_str[64];
+    wgpu_format_size(buf_size, size_str, sizeof(size_str));
+    fprintf(ctx->log, "[WebGPU DEBUG] Freeing buffer: %s\n", size_str);
+  }
   wgpuBufferDestroy(mem);
   return FUTHARK_SUCCESS;
 }
@@ -615,7 +1059,7 @@ static void gpu_create_kernel(struct futhark_context *ctx,
                               gpu_kernel *kernel_out,
                               const char *name) {
   if (ctx->debugging) {
-    fprintf(ctx->log, "Creating kernel %s.\n", name);
+    fprintf(ctx->log, "[WebGPU DEBUG] Creating kernel '%s'.\n", name);
   }
 
   struct wgpu_kernel_info *kernel_info = wgpu_get_kernel_info(name);
@@ -633,7 +1077,7 @@ static void gpu_create_kernel(struct futhark_context *ctx,
   }
 
   WGPUBufferDescriptor scalars_desc = {
-    .label = "kernel scalars",
+    .label = wgpu_str("kernel scalars"),
     .size = kernel_info->scalars_size,
     .usage = WGPUBufferUsage_Uniform | WGPUBufferUsage_CopyDst
   };
@@ -685,7 +1129,7 @@ static void gpu_create_kernel(struct futhark_context *ctx,
     for (int j = 0; j < kernel_info->num_overrides; j++) {
       if (strcmp(kernel_info->used_overrides[j], ctx->override_names[i]) == 0) {
         WGPUConstantEntry *entry = &const_entries[const_idx];
-        entry->key = ctx->override_names[i];
+        entry->key = wgpu_str(ctx->override_names[i]);
         entry->value = ctx->override_values[i];
         const_idx++;
       }
@@ -705,7 +1149,7 @@ static void gpu_create_kernel(struct futhark_context *ctx,
       .layout = kernel->pipeline_layout,
       .compute = {
         .module = kernel_info->gpu_program[0] ? kernel->module : ctx->module,
-        .entryPoint = kernel_info->name,
+        .entryPoint = wgpu_str(kernel_info->name),
         .constantCount = kernel_info->num_overrides,
         .constants = const_entries,
       }
@@ -730,6 +1174,10 @@ static int gpu_scalar_to_device(struct futhark_context *ctx,
                                 const char *provenance,
                                 gpu_mem dst, size_t offset, size_t size,
                                 void *src) {
+  if (ctx->debugging) {
+    fprintf(ctx->log, "[WebGPU DEBUG] Transfer scalar host->device: %zu bytes at offset %zu\n",
+            size, offset);
+  }
   wgpuQueueWriteBuffer(ctx->queue, dst, offset, src, size);
   return FUTHARK_SUCCESS;
 }
@@ -738,6 +1186,11 @@ static int gpu_scalar_from_device(struct futhark_context *ctx,
                                   const char *provenance,
                                   void *dst,
                                   gpu_mem src, size_t offset, size_t size) {
+  if (ctx->debugging) {
+    fprintf(ctx->log, "[WebGPU DEBUG] Transfer scalar device->host: %zu bytes at offset %zu\n",
+            size, offset);
+  }
+
   if (size > 8) {
     futhark_panic(-1, "gpu_scalar_from_device with size %zu > 8 is not allowed\n",
                   size);
@@ -754,10 +1207,10 @@ static int gpu_scalar_from_device(struct futhark_context *ctx,
   WGPUCommandBuffer commandBuffer = wgpuCommandEncoderFinish(encoder, NULL);
   wgpuQueueSubmit(ctx->queue, 1, &commandBuffer);
 
-  WGPUBufferMapAsyncStatus status =
+  WGPUMapAsyncStatus status =
     wgpu_map_buffer_sync(ctx->instance, ctx->scalar_readback_buffer,
                          WGPUMapMode_Read, 0, copy_size);
-  if (status != WGPUBufferMapAsyncStatus_Success) {
+  if (status != WGPUMapAsyncStatus_Success) {
     futhark_panic(-1, "gpu_scalar_from_device: Failed to read scalar from device memory with error %d\n",
                   status);
   }
@@ -777,6 +1230,13 @@ static int memcpy_host2gpu(struct futhark_context *ctx,
                            const unsigned char *src, int64_t src_offset,
                            int64_t nbytes) {
   if (nbytes <= 0) { return FUTHARK_SUCCESS; }
+
+  if (ctx->debugging) {
+    char size_str[64];
+    wgpu_format_size(nbytes, size_str, sizeof(size_str));
+    fprintf(ctx->log, "[WebGPU DEBUG] Transfer host->device: %s at offset %lld\n",
+            size_str, (long long)dst_offset);
+  }
 
   // There is no async copy to device memory at the moment (the spec for
   // `writeBuffer` specifies that a copy of the data is always made and there is
@@ -829,13 +1289,20 @@ static int memcpy_gpu2host(struct futhark_context *ctx,
                            int64_t nbytes) {
   if (nbytes <= 0) { return FUTHARK_SUCCESS; }
 
+  if (ctx->debugging) {
+    char size_str[64];
+    wgpu_format_size(nbytes, size_str, sizeof(size_str));
+    fprintf(ctx->log, "[WebGPU DEBUG] Transfer device->host: %s at offset %lld\n",
+            size_str, (long long)src_offset);
+  }
+
   // Bound storage buffers and copy operations must have sizes multiple of 4.
   // Note that mapping more than `nbytes` is safe because we also pad all
   // buffers when allocating them.
   int64_t buf_size = ((nbytes + 4 - 1) / 4) * 4;
 
   WGPUBufferDescriptor desc = {
-    .label = "tmp_readback",
+    .label = wgpu_str("tmp_readback"),
     .size = buf_size,
     .usage = WGPUBufferUsage_MapRead | WGPUBufferUsage_CopyDst,
   };
@@ -851,14 +1318,32 @@ static int memcpy_gpu2host(struct futhark_context *ctx,
   wgpuQueueSubmit(ctx->queue, 1, &commandBuffer);
 
   // TODO: Could we do an actual async mapping here if `sync` is false?
-  WGPUBufferMapAsyncStatus status =
+  WGPUMapAsyncStatus status =
     wgpu_map_buffer_sync(ctx->instance, readback, WGPUMapMode_Read, 0, buf_size);
-  if (status != WGPUBufferMapAsyncStatus_Success) {
-    futhark_panic(-1, "memcpy_gpu2host: Failed to copy from device memory with error %d\n",
-                  status);
+  if (status != WGPUMapAsyncStatus_Success) {
+    char size_str[64];
+    wgpu_format_size(nbytes, size_str, sizeof(size_str));
+    futhark_panic(-1,
+      "WebGPU error in memcpy_gpu2host: Failed to map readback buffer\n"
+      "  Provenance: %s\n"
+      "  Status: %s (code %d)\n"
+      "  Transfer size: %s\n"
+      "  Source offset: %lld, Destination offset: %lld\n"
+      "  Hint: Buffer mapping failed during device-to-host transfer.\n",
+      provenance ? provenance : "unknown",
+      wgpu_map_status_str(status), status,
+      size_str,
+      (long long)src_offset, (long long)dst_offset);
   }
 
   const void *mapped = wgpuBufferGetConstMappedRange(readback, 0, buf_size);
+  if (mapped == NULL) {
+    futhark_panic(-1,
+      "WebGPU error in memcpy_gpu2host: Failed to get mapped buffer range\n"
+      "  Provenance: %s\n"
+      "  Hint: The buffer may not be properly mapped.\n",
+      provenance ? provenance : "unknown");
+  }
   memcpy(dst + dst_offset, mapped, nbytes);
 
   wgpuBufferUnmap(readback);
@@ -871,6 +1356,13 @@ static int gpu_memcpy(struct futhark_context *ctx,
                       gpu_mem dst, int64_t dst_offset,
                       gpu_mem src, int64_t src_offset,
                       int64_t nbytes) {
+  if (ctx->debugging) {
+    char size_str[64];
+    wgpu_format_size(nbytes, size_str, sizeof(size_str));
+    fprintf(ctx->log, "[WebGPU DEBUG] Transfer device->device: %s (src_offset=%lld, dst_offset=%lld)\n",
+            size_str, (long long)src_offset, (long long)dst_offset);
+  }
+
   // Bound storage buffers and copy operations must have sizes multiple of 4.
   // Note that copying more than `nbytes` is memory-safe because we also pad all
   // buffers when allocating them.
@@ -927,13 +1419,36 @@ static int gpu_launch_kernel(struct futhark_context* ctx,
                              size_t args_sizes[num_args]) {
   struct wgpu_kernel_info *kernel_info = kernel->info;
 
+  // Debug logging for kernel launch (similar to CUDA/OpenCL/HIP backends)
+  int64_t time_start = 0, time_end = 0;
+  if (ctx->debugging) {
+    fprintf(ctx->log, "[WebGPU DEBUG] Launching kernel '%s'\n", name);
+    fprintf(ctx->log, "[WebGPU DEBUG]   grid=[%d,%d,%d] workgroup=[%d,%d,%d]\n",
+            grid[0], grid[1], grid[2], block[0], block[1], block[2]);
+    fprintf(ctx->log, "[WebGPU DEBUG]   shared_memory=%u bytes, num_args=%d\n",
+            shared_mem_bytes, num_args);
+    if (provenance != NULL) {
+      fprintf(ctx->log, "[WebGPU DEBUG]   provenance: %s\n", provenance);
+    }
+    time_start = get_wall_time();
+  }
+
   if (num_args !=
       kernel_info->num_shared_mem_overrides
       + kernel_info->num_scalars
       + kernel_info->num_bindings
   ) {
-    futhark_panic(-1, "Kernel %s called with num_args not maching its info\n",
-                  name);
+    futhark_panic(-1,
+      "WebGPU error in gpu_launch_kernel: Argument count mismatch for kernel '%s'\n"
+      "  Expected: %zu args (shared_mem=%zu + scalars=%zu + bindings=%zu)\n"
+      "  Received: %d args\n"
+      "  Hint: This is an internal error - kernel metadata doesn't match invocation.\n",
+      name,
+      kernel_info->num_shared_mem_overrides + kernel_info->num_scalars + kernel_info->num_bindings,
+      kernel_info->num_shared_mem_overrides,
+      kernel_info->num_scalars,
+      kernel_info->num_bindings,
+      num_args);
   }
 
   int shared_mem_start = 0;
@@ -974,21 +1489,38 @@ static int gpu_launch_kernel(struct futhark_context* ctx,
     .entries = bg_entries,
   };
   WGPUBindGroup bg = wgpuDeviceCreateBindGroup(ctx->device, &bg_desc);
+  if (bg == NULL) {
+    futhark_panic(-1,
+      "WebGPU error in gpu_launch_kernel: Failed to create bind group for kernel '%s'\n"
+      "  Provenance: %s\n"
+      "  Bindings count: %zu (plus scalars)\n"
+      "  Hint: Check buffer bindings - a buffer may be invalid or destroyed.\n",
+      name, provenance ? provenance : "unknown",
+      kernel_info->num_bindings);
+  }
 
   WGPUComputePipeline pipeline;
-  if (kernel->static_pipeline) { pipeline = kernel->pipeline; }
-  else {
+  if (kernel->static_pipeline) {
+    pipeline = kernel->pipeline;
+    if (pipeline == NULL) {
+      futhark_panic(-1,
+        "WebGPU error in gpu_launch_kernel: Static pipeline is NULL for kernel '%s'\n"
+        "  Provenance: %s\n"
+        "  Hint: Kernel may not have been properly initialized.\n",
+        name, provenance ? provenance : "unknown");
+    }
+  } else {
     int const_entry_idx = kernel->const_entries_set;
     for (int i = 0; i < kernel_info->num_dynamic_block_dims; i++) {
       WGPUConstantEntry *entry = &kernel->const_entries[const_entry_idx];
       const_entry_idx++;
-      entry->key = kernel_info->dynamic_block_dim_names[i];
+      entry->key = wgpu_str(kernel_info->dynamic_block_dim_names[i]);
       entry->value = (double) block[kernel_info->dynamic_block_dim_indices[i]];
     }
     for (int i = 0; i < kernel_info->num_shared_mem_overrides; i++) {
       WGPUConstantEntry *entry = &kernel->const_entries[const_entry_idx];
       const_entry_idx++;
-      entry->key = kernel_info->shared_mem_overrides[i];
+      entry->key = wgpu_str(kernel_info->shared_mem_overrides[i]);
       entry->value = (double) *((int32_t *) args[shared_mem_start + i]);
     }
 
@@ -996,18 +1528,39 @@ static int gpu_launch_kernel(struct futhark_context* ctx,
       .layout = kernel->pipeline_layout,
       .compute = {
         .module = kernel->module,
-        .entryPoint = kernel_info->name,
+        .entryPoint = wgpu_str(kernel_info->name),
         .constantCount = kernel_info->num_overrides,
         .constants = kernel->const_entries,
       }
     };
     pipeline = wgpuDeviceCreateComputePipeline(ctx->device, &desc);
+    if (pipeline == NULL) {
+      futhark_panic(-1,
+        "WebGPU error in gpu_launch_kernel: Failed to create compute pipeline for kernel '%s'\n"
+        "  Provenance: %s\n"
+        "  Hint: Check shader compilation errors - the entry point or constants may be invalid.\n",
+        name, provenance ? provenance : "unknown");
+    }
   }
 
   WGPUCommandEncoder encoder = wgpuDeviceCreateCommandEncoder(ctx->device, NULL);
+  if (encoder == NULL) {
+    futhark_panic(-1,
+      "WebGPU error in gpu_launch_kernel: Failed to create command encoder for kernel '%s'\n"
+      "  Provenance: %s\n"
+      "  Hint: The device may be lost or in an invalid state.\n",
+      name, provenance ? provenance : "unknown");
+  }
 
   WGPUComputePassEncoder pass_encoder
     = wgpuCommandEncoderBeginComputePass(encoder, NULL);
+  if (pass_encoder == NULL) {
+    futhark_panic(-1,
+      "WebGPU error in gpu_launch_kernel: Failed to begin compute pass for kernel '%s'\n"
+      "  Provenance: %s\n"
+      "  Hint: Command encoder may be in an invalid state.\n",
+      name, provenance ? provenance : "unknown");
+  }
   wgpuComputePassEncoderSetPipeline(pass_encoder, pipeline);
   wgpuComputePassEncoderSetBindGroup(pass_encoder, 0, bg, 0, NULL);
   wgpuComputePassEncoderDispatchWorkgroups(pass_encoder,
@@ -1017,7 +1570,16 @@ static int gpu_launch_kernel(struct futhark_context* ctx,
   WGPUCommandBuffer cmd_buffer = wgpuCommandEncoderFinish(encoder, NULL);
   wgpuQueueSubmit(ctx->queue, 1, &cmd_buffer);
 
+  // Debug timing: synchronize and report execution time
+  if (ctx->debugging) {
+    futhark_context_sync(ctx);
+    time_end = get_wall_time();
+    long int time_diff = time_end - time_start;
+    fprintf(ctx->log, "[WebGPU DEBUG]   runtime: %ldus\n", time_diff);
+  }
+
   free(scalars);
+  free(bg_entries);
 
   return FUTHARK_SUCCESS;
 }

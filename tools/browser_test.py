@@ -4,6 +4,7 @@ import argparse
 import base64
 import json
 import shlex
+import shutil
 import subprocess
 import sys
 import os
@@ -210,6 +211,12 @@ async def handle_ws(request):
 def start_browser():
     options = webdriver.ChromeOptions()
 
+    # Use chromium from PATH if available (e.g., from nix-shell)
+    # This ensures we use the matching chromium/chromedriver versions
+    chromium_path = shutil.which("chromium")
+    if chromium_path:
+        options.binary_location = chromium_path
+
     if headless:
         options.add_argument("--headless=new")
 
@@ -231,6 +238,9 @@ def start_browser():
             options.add_argument("--no-sandbox")
             options.add_argument("--use-angle=vulkan")
             options.add_argument("--disable-vulkan-surface")
+            # Use SwiftShader for CPU-based WebGPU rendering in CI environments
+            options.add_argument("--use-webgpu-adapter=swiftshader")
+            options.add_argument("--disable-gpu-blocklist")
 
         driver = webdriver.Chrome(options=options)
 

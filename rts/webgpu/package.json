@@ -1,0 +1,22 @@
+{
+  "name": "futhark-webgpu-runtime",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Futhark WebGPU JavaScript runtime",
+  "scripts": {
+    "build": "tsc",
+    "build:watch": "tsc --watch",
+    "typecheck": "tsc --noEmit",
+    "lint": "eslint *.ts",
+    "format": "prettier --write *.ts",
+    "format:check": "prettier --check *.ts",
+    "clean": "rm -f *.js *.js.map"
+  },
+  "devDependencies": {
+    "typescript": "^5.3.0",
+    "eslint": "^8.56.0",
+    "@typescript-eslint/parser": "^6.19.0",
+    "@typescript-eslint/eslint-plugin": "^6.19.0",
+    "prettier": "^3.2.0"
+  }
+}
