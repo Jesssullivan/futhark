@@ -11,6 +11,14 @@ pkgs.stdenv.mkDerivation {
 
   EM_CACHE = "${PWD}/em_cache";
 
+  # Build WebGPU TypeScript runtime on shell entry
+  shellHook = ''
+    if [ -f rts/webgpu/package.json ]; then
+      echo "Building WebGPU TypeScript runtime..."
+      (cd rts/webgpu && npm run build 2>/dev/null || true)
+    fi
+  '';
+
   buildInputs =
     (import ./nix/pkgs-style.nix {pkgs=pkgs; haskell=haskell; python=python;}) ++
     (with pkgs;

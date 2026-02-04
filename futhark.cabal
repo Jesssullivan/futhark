@@ -82,10 +82,15 @@ extra-source-files:
     rts/python/values.py
     rts/python/opencl.py
     rts/python/scalar.py
-    rts/webgpu/server_ws.js
-    rts/webgpu/util.js
-    rts/webgpu/values.js
-    rts/webgpu/wrappers.js
+    rts/webgpu/server_ws.ts
+    rts/webgpu/util.ts
+    rts/webgpu/values.ts
+    rts/webgpu/wrappers.ts
+    rts/webgpu/types/emscripten.d.ts
+    rts/webgpu/types/futhark.d.ts
+    rts/webgpu/types/webgpu.d.ts
+    rts/webgpu/package.json
+    rts/webgpu/tsconfig.json
     rts/wgsl/scalar.wgsl
     rts/wgsl/scalar8.wgsl
     rts/wgsl/scalar16.wgsl

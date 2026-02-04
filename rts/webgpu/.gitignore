@@ -1,2 +1,8 @@
 node_modules/
 *.js.map
+
+# Generated JavaScript files (compiled from TypeScript)
+# These are built automatically by:
+#   - Setup.hs preBuild hook (during cabal build)
+#   - shell.nix shellHook (on nix-shell entry)
+*.js
