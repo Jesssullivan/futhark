@@ -90,6 +90,9 @@ class BrowserServer {
                     throw new FutharkError(`Unknown command: '${msg.cmd}'`, { command: msg.cmd, availableCommands: available });
                 }
                 const fun = this.commands[msg.cmd];
+                if (!fun) {
+                    throw new FutharkError(`Command handler not found: '${msg.cmd}'`, { command: msg.cmd, availableCommands: Object.keys(this.commands) });
+                }
                 const args = Array.isArray(msg.args) ? msg.args : [];
                 const res = await fun(...args);
                 await this.fut.context_sync();
@@ -126,8 +129,9 @@ class BrowserServer {
      * @throws FutharkError if entry point not found
      */
     get_entry_point(entry) {
-        if (entry in this.fut.entry) {
-            return this.fut.entry[entry];
+        const entryFn = this.fut.entry[entry];
+        if (entryFn) {
+            return entryFn;
         }
         const available = Object.keys(this.fut.available_entry_points);
         throw new FutharkError(`Unknown entry point: '${entry}'`, { operation: 'get_entry_point', entryPoint: entry, availableEntryPoints: available });
@@ -139,8 +143,9 @@ class BrowserServer {
      * @throws FutharkError if entry point not found
      */
     get_manifest_entry_point(entry) {
-        if (entry in this.fut.manifest.entry_points) {
-            return this.fut.manifest.entry_points[entry];
+        const entryInfo = this.fut.manifest.entry_points[entry];
+        if (entryInfo) {
+            return entryInfo;
         }
         const available = Object.keys(this.fut.manifest.entry_points);
         throw new FutharkError(`Unknown entry point: '${entry}'`, { operation: 'get_manifest_entry_point', entryPoint: entry, availableEntryPoints: available });
@@ -152,8 +157,9 @@ class BrowserServer {
      * @throws FutharkError if type not found
      */
     get_manifest_type(type) {
-        if (type in this.fut.manifest.types) {
-            return this.fut.manifest.types[type];
+        const typeInfo = this.fut.manifest.types[type];
+        if (typeInfo) {
+            return typeInfo;
         }
         const available = Object.keys(this.fut.manifest.types);
         throw new FutharkError(`Unknown type: '${type}'`, { operation: 'get_manifest_type', type, availableTypes: available });
@@ -186,6 +192,7 @@ class BrowserServer {
      */
     get_var(name) {
         this.check_var(name);
+        // Safe to use non-null assertion after check_var validation
         return this.vars[name];
     }
     /**
@@ -274,7 +281,11 @@ class BrowserServer {
                     const type_info = this.get_manifest_type(type);
                     futhark_assert(type_info.kind === "array", `restore: type '${type}' is not an array type`, { operation: 'restore', variable: name, type, typeKind: type_info.kind });
                     const [arrData, shape] = raw_val;
-                    val = this.fut.types[type].from_data(arrData, ...shape);
+                    const typeClass = this.fut.types[type];
+                    if (!typeClass) {
+                        throw new FutharkError(`restore: array type class not found for type '${type}'`, { operation: 'restore', type, availableTypes: Object.keys(this.fut.types) });
+                    }
+                    val = typeClass.from_data(arrData, ...shape);
                 }
                 else {
                     // Scalar.
@@ -347,7 +358,13 @@ class BrowserServer {
         await this.fut.context_sync();
         const endTime = performance.now();
         for (let i = 0; i < outNames.length; i++) {
-            this.set_var(outNames[i], outs[i], entry_info.outputs[i].type);
+            const outName = outNames[i];
+            const outVal = outs[i];
+            const outputInfo = entry_info.outputs[i];
+            if (!outName || outVal === undefined || !outputInfo) {
+                throw new FutharkError(`cmd_call: output index ${i} is out of bounds`, { operation: 'cmd_call', entryPoint: entry, outputIndex: i, outputCount: outNames.length });
+            }
+            this.set_var(outName, outVal, outputInfo.type);
         }
         return "runtime: " + Math.round((endTime - startTime) * 1000).toString();
     }

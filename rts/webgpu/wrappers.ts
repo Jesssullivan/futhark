@@ -64,7 +64,19 @@ class FutharkArray {
 // eslint-disable-next-line @typescript-eslint/no-unused-vars
 function make_array_class(fut: FutharkModule, name: string): FutharkArrayClass {
   const type_info = fut.manifest.types[name];
+  if (!type_info) {
+    throw new FutharkError(
+      `Unknown array type: '${name}'`,
+      { operation: 'make_array_class', type: name, availableTypes: Object.keys(fut.manifest.types) }
+    );
+  }
   const prim_info = primInfos[type_info.elemtype];
+  if (!prim_info) {
+    throw new FutharkError(
+      `Unknown element type: '${type_info.elemtype}' for array type '${name}'`,
+      { operation: 'make_array_class', type: name, elemType: type_info.elemtype, supportedTypes: Object.keys(primInfos) }
+    );
+  }
 
   /**
    * Gets a WASM function by its full name.
@@ -121,18 +133,28 @@ function make_array_class(fut: FutharkModule, name: string): FutharkArrayClass {
       let bigIntShape: BigInt64Array;
       if (shape.length === 0) {
         bigIntShape = new BigInt64Array(0);
-      } else if (typeof(shape[0]) === 'number') {
-        bigIntShape = BigInt64Array.from(shape.map((x) => BigInt(x)));
       } else {
-        bigIntShape = BigInt64Array.from(shape as bigint[]);
+        const firstElem = shape[0];
+        if (typeof firstElem === 'number') {
+          bigIntShape = BigInt64Array.from(shape.map((x) => BigInt(x)));
+        } else {
+          bigIntShape = BigInt64Array.from(shape as bigint[]);
+        }
       }
 
       // Validate shape dimensions are non-negative
       for (let i = 0; i < bigIntShape.length; i++) {
+        const dim = bigIntShape[i];
+        if (dim === undefined) {
+          throw new FutharkError(
+            `Shape dimension ${i} is undefined`,
+            { operation: 'from_data', type: name, dimension: i }
+          );
+        }
         futhark_assert(
-          bigIntShape[i] >= 0n,
-          `Shape dimension ${i} cannot be negative: ${bigIntShape[i]}`,
-          { operation: 'from_data', type: name, dimension: i, value: Number(bigIntShape[i]) }
+          dim >= 0n,
+          `Shape dimension ${i} cannot be negative: ${dim}`,
+          { operation: 'from_data', type: name, dimension: i, value: Number(dim) }
         );
       }
 
@@ -240,6 +262,12 @@ function make_entry_function(
   name: string
 ): (...inputs: (FutharkScalar | FutharkArray)[]) => Promise<(FutharkScalar | FutharkArray)[]> {
   const entry_info = fut.manifest.entry_points[name];
+  if (!entry_info) {
+    throw new FutharkError(
+      `Unknown entry point: '${name}'`,
+      { operation: 'make_entry_function', entryPoint: name, availableEntryPoints: Object.keys(fut.manifest.entry_points) }
+    );
+  }
 
   /**
    * Calls the Futhark entry point with the given inputs.
@@ -261,8 +289,15 @@ function make_entry_function(
 
     // Validate and convert inputs
     for (let i = 0; i < inputs.length; i++) {
-      const typ = entry_info.inputs[i].type;
+      const inputInfo = entry_info.inputs[i];
       const input = inputs[i];
+      if (!inputInfo || input === undefined) {
+        throw new FutharkError(
+          `Entry point '${name}' argument ${i} is missing`,
+          { operation: 'call', entryPoint: name, argIndex: i }
+        );
+      }
+      const typ = inputInfo.type;
 
       if (typ in primInfos) {
         // Scalar type - validate and convert
@@ -272,11 +307,24 @@ function make_entry_function(
             { operation: 'call', entryPoint: name, argIndex: i, expectedType: typ, gotType: 'FutharkArray' }
           );
         }
-        const converted = primInfos[typ].scalar_type(input as number | bigint);
+        const prim = primInfos[typ];
+        if (!prim) {
+          throw new FutharkError(
+            `Entry point '${name}' argument ${i}: unknown primitive type '${typ}'`,
+            { operation: 'call', entryPoint: name, argIndex: i, unknownType: typ }
+          );
+        }
+        const converted = prim.scalar_type(input as number | bigint);
         real_inputs.push(converted as number | bigint);
       }
       else if (typ in fut.manifest.types) {
         const type_info = fut.manifest.types[typ];
+        if (!type_info) {
+          throw new FutharkError(
+            `Entry point '${name}' argument ${i}: type '${typ}' not found in manifest`,
+            { operation: 'call', entryPoint: name, argIndex: i, unknownType: typ }
+          );
+        }
         if (type_info.kind === "array") {
           // Array type - validate
           if (!(input instanceof FutharkArray)) {
@@ -338,22 +386,70 @@ function make_entry_function(
     const outputs: (FutharkScalar | FutharkArray)[] = [];
     for (let i = 0; i < out_ptrs.length; i++) {
       const out_info = entry_info.outputs[i];
+      const out_ptr = out_ptrs[i];
+      if (!out_info || out_ptr === undefined) {
+        throw new FutharkError(
+          `Entry point '${name}' output ${i} is missing`,
+          { operation: 'call', entryPoint: name, outputIndex: i }
+        );
+      }
       if (out_info.type in primInfos) {
         const prim_info = primInfos[out_info.type];
+        if (!prim_info) {
+          throw new FutharkError(
+            `Entry point '${name}' output ${i}: unknown primitive type '${out_info.type}'`,
+            { operation: 'call', entryPoint: name, outputIndex: i, unknownType: out_info.type }
+          );
+        }
         const heap = prim_info.get_heap(fut.m);
-        const val = heap[out_ptrs[i] / prim_info.size];
+        const heapIndex = out_ptr / prim_info.size;
+        const val = heap[heapIndex];
+        if (val === undefined) {
+          throw new FutharkError(
+            `Entry point '${name}' output ${i}: failed to read value from heap`,
+            { operation: 'call', entryPoint: name, outputIndex: i, heapIndex }
+          );
+        }
         outputs.push(val as FutharkScalar);
       }
       else if (out_info.type in fut.manifest.types) {
         const type_info = fut.manifest.types[out_info.type];
+        if (!type_info) {
+          throw new FutharkError(
+            `Entry point '${name}' output ${i}: type '${out_info.type}' not found in manifest`,
+            { operation: 'call', entryPoint: name, outputIndex: i, unknownType: out_info.type }
+          );
+        }
         if (type_info.kind === "array") {
           const array_type = fut.types[out_info.type];
-          const val = array_type.from_native(fut.m.HEAP32[out_ptrs[i] / 4]);
+          if (!array_type) {
+            throw new FutharkError(
+              `Entry point '${name}' output ${i}: array type class '${out_info.type}' not found`,
+              { operation: 'call', entryPoint: name, outputIndex: i, unknownType: out_info.type }
+            );
+          }
+          const heapIndex = out_ptr / 4;
+          const nativePtr = fut.m.HEAP32[heapIndex];
+          if (nativePtr === undefined) {
+            throw new FutharkError(
+              `Entry point '${name}' output ${i}: failed to read native pointer from heap`,
+              { operation: 'call', entryPoint: name, outputIndex: i, heapIndex }
+            );
+          }
+          const val = array_type.from_native(nativePtr);
           outputs.push(val);
         }
         else {
           // Opaque type - return raw value
-          outputs.push(fut.m.HEAP32[out_ptrs[i] / 4] as number);
+          const heapIndex = out_ptr / 4;
+          const val = fut.m.HEAP32[heapIndex];
+          if (val === undefined) {
+            throw new FutharkError(
+              `Entry point '${name}' output ${i}: failed to read opaque value from heap`,
+              { operation: 'call', entryPoint: name, outputIndex: i, heapIndex }
+            );
+          }
+          outputs.push(val as number);
         }
       }
       else {

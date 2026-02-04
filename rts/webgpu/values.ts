@@ -35,9 +35,16 @@ class FutharkReader {
   /**
    * Reads a single byte and advances the position.
    * @returns The byte value (0-255)
+   * @throws FutharkError if the buffer is empty
    */
   private read_byte(): number {
     const b = this.buf[0];
+    if (b === undefined) {
+      throw new FutharkError(
+        'Cannot read byte: buffer is empty',
+        { operation: 'read_byte' }
+      );
+    }
     this.seek(1);
     return b;
   }
@@ -45,10 +52,23 @@ class FutharkReader {
   /**
    * Reads a 64-bit signed integer (little-endian) and advances the position.
    * @returns The 64-bit integer value
+   * @throws FutharkError if the buffer has insufficient data
    */
   private read_i64(): bigint {
+    if (this.buf.length < 8) {
+      throw new FutharkError(
+        'Cannot read i64: buffer has less than 8 bytes',
+        { operation: 'read_i64', availableBytes: this.buf.length }
+      );
+    }
     const buf = new Uint8Array(this.buf.subarray(0, 8));
     const val = new BigInt64Array(buf.buffer, 0, 1)[0];
+    if (val === undefined) {
+      throw new FutharkError(
+        'Cannot read i64: unexpected undefined value',
+        { operation: 'read_i64' }
+      );
+    }
     this.seek(8);
     return val;
   }
@@ -69,7 +89,11 @@ class FutharkReader {
     }
 
     let off = 0;
-    while (off < this.buf.length && this.is_whitespace(this.buf[off])) off++;
+    while (off < this.buf.length) {
+      const byte = this.buf[off];
+      if (byte === undefined || !this.is_whitespace(byte)) break;
+      off++;
+    }
     this.seek(off);
 
     // Validate minimum header size (1 magic + 1 version + 1 rank + 4 type = 7 bytes)
@@ -160,10 +184,16 @@ class FutharkReader {
    * @param type - The element type (e.g., "i32", "f64")
    * @param shape - Array dimensions as BigInts
    * @returns Tuple of [flat data array, shape]
-   * @throws FutharkError if there is insufficient data in the buffer
+   * @throws FutharkError if there is insufficient data in the buffer or unknown type
    */
   private read_array(type: string, shape: bigint[]): FutharkArrayData {
     const type_info = primInfos[type];
+    if (!type_info) {
+      throw new FutharkError(
+        `Unknown primitive type: '${type}'`,
+        { operation: 'read_array', type, supportedTypes: Object.keys(primInfos) }
+      );
+    }
     const flat_len = shape.length === 0 ? 1 : Number(shape.reduce((a, b) => a * b, 1n));
     const required_bytes = flat_len * type_info.size;
 
@@ -250,7 +280,8 @@ class FutharkWriter {
       flat_len = shape.length === 0 ? 1 : Number(shape.reduce((a, b) => a * b, 1n));
     }
 
-    const prim_info = primInfos[elem_type];
+    // prim_info is guaranteed to exist here because we validated elem_type above
+    const prim_info = primInfos[elem_type]!;
     const header_size = 3 + 4;
     const total_size = header_size + rank * 8 + flat_len * prim_info.size;
 
