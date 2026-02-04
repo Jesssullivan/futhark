@@ -12,6 +12,9 @@
 
 set -e
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(dirname "$SCRIPT_DIR")"
+
 PROGRAM="$1"
 if [ -z "$PROGRAM" ]; then
     echo "Usage: $0 <compiled-webgpu-program>"
@@ -23,4 +26,4 @@ if [ -z "$PROGRAM" ]; then
 fi
 
 # -a: auto-select display number to avoid conflicts
-xvfb-run -a python tools/browser_test.py "$PROGRAM"
+xvfb-run -a python "$REPO_ROOT/tools/browser_test.py" "$PROGRAM"

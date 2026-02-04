@@ -52,6 +52,7 @@ pkgs.stdenv.mkDerivation {
       python3Packages.selenium
       chromium
       chromedriver
+      xvfb-run  # Required for headless WebGPU testing
     ]
     ++ lib.optionals (stdenv.isLinux)
       [ opencl-headers

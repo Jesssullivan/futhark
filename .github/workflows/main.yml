@@ -586,6 +586,7 @@ jobs:
   test-webgpu-primitives:
     runs-on: ubuntu-22.04
     needs: [build-linux-nix]
+    timeout-minutes: 45
 
     steps:
     - uses: actions/checkout@v4
@@ -643,6 +644,7 @@ jobs:
   test-webgpu-soacs:
     runs-on: ubuntu-22.04
     needs: [build-linux-nix]
+    timeout-minutes: 45
 
     steps:
     - uses: actions/checkout@v4
@@ -697,6 +699,7 @@ jobs:
   test-webgpu-specific:
     runs-on: ubuntu-22.04
     needs: [build-linux-nix]
+    timeout-minutes: 45
 
     steps:
     - uses: actions/checkout@v4
@@ -739,6 +742,89 @@ jobs:
           else
             echo 'No tests/webgpu directory found, skipping'
           fi
+        "
+
+  test-webgpu-compile:
+    runs-on: ubuntu-22.04
+    needs: [build-linux-nix]
+    timeout-minutes: 30
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install Nix
+      uses: cachix/install-nix-action@v27
+
+    - uses: cachix/cachix-action@v15
+      with:
+        name: futhark
+        signingKey: '${{ secrets.CACHIX_SIGNING_KEY }}'
+
+    - uses: actions/download-artifact@v4
+      with:
+        name: futhark-nightly-linux-x86_64.tar.xz
+
+    - name: Install from nightly tarball
+      run: |
+        tar xvf futhark-nightly-linux-x86_64.tar.xz
+        make -C futhark-nightly-linux-x86_64/ install PREFIX=$HOME/.local
+        echo "$HOME/.local/bin" >> $GITHUB_PATH
+
+    - name: Test WebGPU compilation (structure tests only)
+      run: |
+        nix-shell --run "
+          futhark test \
+            -s \
+            --backend=webgpu \
+            --no-tuning \
+            --exclude=no_webgpu \
+            tests
+        "
+
+  test-webgpu-full:
+    runs-on: ubuntu-22.04
+    needs: [build-linux-nix]
+    timeout-minutes: 60
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install Nix
+      uses: cachix/install-nix-action@v27
+
+    - uses: cachix/cachix-action@v15
+      with:
+        name: futhark
+        signingKey: '${{ secrets.CACHIX_SIGNING_KEY }}'
+
+    - name: Install system dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y xvfb
+
+    - uses: actions/download-artifact@v4
+      with:
+        name: futhark-nightly-linux-x86_64.tar.xz
+
+    - name: Install from nightly tarball
+      run: |
+        tar xvf futhark-nightly-linux-x86_64.tar.xz
+        make -C futhark-nightly-linux-x86_64/ install PREFIX=$HOME/.local
+        echo "$HOME/.local/bin" >> $GITHUB_PATH
+
+    - name: Run full WebGPU test suite
+      run: |
+        nix-shell --run "
+          futhark test \
+            -c \
+            --backend=webgpu \
+            --runner=./tools/webgpu-runner.sh \
+            --no-tuning \
+            --no-terminal \
+            --exclude=no_webgpu \
+            --exclude=compiled \
+            --concurrency=1 \
+            tests
         "
 
   test-ir-parser:
