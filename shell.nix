@@ -54,7 +54,8 @@ pkgs.stdenv.mkDerivation {
       chromedriver
     ]
     ++ lib.optionals (stdenv.isLinux)
-      [ opencl-headers
+      [ xvfb-run  # For headless browser testing
+        opencl-headers
         ocl-icd
         (pkgs.callPackage ./nix/oclgrind.nix {})
         rocmPackages.clr
